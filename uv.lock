@@ -728,10 +728,11 @@ wheels = [
 
 [[package]]
 name = "kpubdata"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "../kpubdata" }
 dependencies = [
     { name = "httpx" },
+    { name = "pyyaml" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 
@@ -750,12 +751,19 @@ requires-dist = [
     { name = "pymdown-extensions", marker = "extra == 'docs'", specifier = ">=10,<12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2,<10" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5,<8" },
+    { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<1" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.10" },
     { name = "xmltodict", marker = "extra == 'dev'", specifier = ">=0.13,<2" },
     { name = "xmltodict", marker = "extra == 'xml'", specifier = ">=0.13,<2" },
 ]
 provides-extras = ["xml", "pandas", "krx", "validation", "mcp", "dev", "docs"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "types-pyyaml", specifier = ">=6.0.12.20260906" },
+]
 
 [[package]]
 name = "kpubdata-builder"
