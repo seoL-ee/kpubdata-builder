@@ -18,7 +18,7 @@ dialect 의 MERGE/ON DUPLICATE 지원 여부에 의존하지 않는다.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import (
     Column,
@@ -93,7 +93,7 @@ class CubridBuildIndex:
             self._builds.create(conn, checkfirst=True)
             conn.execute(insert(self._schema_version).values(version=SCHEMA_VERSION))
 
-    def _row_to_entry(self, row: Row) -> BuildEntry:
+    def _row_to_entry(self, row: Row[Any]) -> BuildEntry:
         m = row._mapping
         return BuildEntry(
             run_id=m["run_id"],
