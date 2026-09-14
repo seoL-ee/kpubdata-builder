@@ -69,7 +69,7 @@ jobs:
       - name: Run CUBRID contract tests
         env:
           # CUBRID 기본 dba/빈 비밀번호(개발용). broker 포트 33000.
-          KPUBDATA_BUILDER_CUBRID_URL: cubrid://dba:@127.0.0.1:33000/kpubdata?charset=utf8
+          KPUBDATA_BUILDER_CUBRID_URL: cubrid+pycubrid://dba:@127.0.0.1:33000/kpubdata?charset=utf8
         run: uv run --no-sources pytest tests/cubrid -m cubrid -v
 
       - name: CUBRID logs on failure

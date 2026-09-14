@@ -49,7 +49,7 @@ def cubrid_url() -> str:
     if not url:
         raise RuntimeError(
             f"{_BACKEND_ENV}=cubrid requires {_CUBRID_URL_ENV} "
-            "(SQLAlchemy URL, e.g. cubrid://user:pass@host:33000/db?charset=utf8)"
+            "(SQLAlchemy URL, e.g. cubrid+pycubrid://user:pass@host:33000/db?charset=utf8)"
         )
     return url
 

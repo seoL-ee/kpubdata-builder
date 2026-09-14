@@ -72,7 +72,7 @@ docker build --build-arg EXTRAS="publish cubrid" -t kpubdata-builder:cubrid .
 docker run --rm -p 8000:8000 \
   -e KPUBDATA_BUILDER_API_KEY="$API_KEY" \
   -e KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid \
-  -e KPUBDATA_BUILDER_CUBRID_URL="cubrid://user:pass@cubrid-host:33000/kpubdata?charset=utf8" \
+  -e KPUBDATA_BUILDER_CUBRID_URL="cubrid+pycubrid://user:pass@cubrid-host:33000/kpubdata?charset=utf8" \
   -v /mnt/blockvol/data:/data \
   kpubdata-builder:cubrid
 ```

@@ -41,7 +41,7 @@ services:
       KPUBDATA_BUILDER_API_KEY: ${KPUBDATA_BUILDER_API_KEY:?set KPUBDATA_BUILDER_API_KEY in .env}
       KPUBDATA_BUILDER_STORAGE_BACKEND: cubrid
       # 기본 dba/빈 비밀번호는 개발용 — 운영에서는 CUBRID 사용자/비밀번호를 설정하고 URL 을 갱신할 것.
-      KPUBDATA_BUILDER_CUBRID_URL: ${KPUBDATA_BUILDER_CUBRID_URL:-cubrid://dba:@cubrid:33000/kpubdata?charset=utf8}
+      KPUBDATA_BUILDER_CUBRID_URL: ${KPUBDATA_BUILDER_CUBRID_URL:-cubrid+pycubrid://dba:@cubrid:33000/kpubdata?charset=utf8}
       KPUBDATA_BUILDER_ALLOWED_ORIGINS: ${KPUBDATA_BUILDER_ALLOWED_ORIGINS:-}
       # OIDC Bearer(선택, ADR 0009). 설정 시 allowlist 중 하나 필수(fail-closed).
       OIDC_ISSUER: ${OIDC_ISSUER:-}
