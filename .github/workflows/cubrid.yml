@@ -21,7 +21,7 @@ on:
       - "uv.lock"
       - ".github/workflows/cubrid.yml"
   push:
-    branches: [main]
+    branches: [main, integrate/issue-497]
   workflow_dispatch:
 
 permissions:
