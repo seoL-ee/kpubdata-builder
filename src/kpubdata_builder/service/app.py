@@ -49,7 +49,7 @@ from ..spec.serializer import BUILDSPEC_SNAPSHOT_FILENAME, compute_spec_digest
 from ..spec.validator import validate_spec
 from ..stages._path_safety import ensure_within, validate_path_segment
 from ..stages.bronze.build import SourceClient
-from ..store import BuildIndex
+from ..store import make_build_index
 from ..tabular import DEFAULT_PREVIEW_LIMIT
 from . import datasets as datasets_service
 from . import ownership as ownership_module
@@ -250,7 +250,7 @@ class BuilderService:
     ) -> None:
         self._output_root = output_root
         self._client_factory = client_factory
-        self._build_index = BuildIndex(output_root)  # #309, ADR 0003
+        self._build_index = make_build_index(output_root)  # #309, ADR 0003/0013
         self._query_service = query_service or QueryService()
         repository = credential_repository or _credential_repository_from_env(output_root)
         self._credential_resolver = CredentialResolver(repository)
