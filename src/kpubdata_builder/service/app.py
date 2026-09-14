@@ -18,12 +18,16 @@ import inspect
 import json
 import logging
 import os
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
+from urllib.parse import unquote, urlsplit
 
 import yaml
-from kpubdata import Client
 from kpubdata.core.models import DatasetRef
 from typing_extensions import assert_never
 
@@ -33,7 +37,17 @@ from ..credentials import (
     SQLiteCredentialRepository,
 )
 from ..errors import SpecLoadError, ValidationError
-from ..pipeline import DEFAULT_PREVIEW_SEED, SampleMode, preview_build, run_build
+from ..events import BuildEvent, BuildEventStore
+from ..ingestion import IngestionError, parse_tabular_bytes
+from ..manifest import status_from_manifest
+from ..pipeline import (
+    DEFAULT_PREVIEW_SEED,
+    CancellationProbe,
+    SampleMode,
+    preview_build,
+    run_build,
+)
+from ..publishers import PUBLISHER_REGISTRY
 from ..quality import QualityCheckResult
 from ..query.engine import QueryExecutionError, QueryTimeoutError
 from ..query.models import QueryRequest, QueryStage
@@ -45,6 +59,7 @@ from ..query.resolver import (
 from ..query.security import UnsafeQueryError, validate_read_only_sql
 from ..query.service import QueryBusyError, QueryService
 from ..spec import BuildSpec, JsonValue, parse_spec
+from ..spec.models import SOURCE_FILE_FORMATS
 from ..spec.serializer import BUILDSPEC_SNAPSHOT_FILENAME, compute_spec_digest
 from ..spec.validator import validate_spec
 from ..stages._path_safety import ensure_within, validate_path_segment
@@ -53,8 +68,17 @@ from ..store import make_build_index
 from ..store.artifacts import make_artifact_store
 from ..store.backend import storage_backend
 from ..tabular import DEFAULT_PREVIEW_LIMIT
+from ..uploads import (
+    SQLiteUploadRepository,
+    UploadMetadata,
+    UploadRepository,
+    resolve_max_upload_bytes,
+)
 from . import datasets as datasets_service
+from . import events as events_service
+from . import monitoring as monitoring_service
 from . import ownership as ownership_module
+from . import publish as publish_service
 from . import quality as quality_service
 from . import stages as stages_service
 from .auth import AuthError, Principal, authenticate
@@ -67,10 +91,13 @@ from .providers import (
     default_provider_test,
     provider_descriptors,
     run_provider_test,
+    runtime_provider_catalog,
     test_result_body,
 )
 from .responses import FileResponse, ServiceResponse
 from .routes import ROUTE_ADAPTERS
+from .routes import uploads as uploads_route
+from .routes.core import MAX_PREVIEW_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +105,15 @@ _CREDENTIAL_MASTER_KEY_ENV = "KPUBDATA_BUILDER_CREDENTIAL_MASTER_KEY"
 _PROVIDER_TEST_TIMEOUT_ENV = "KPUBDATA_BUILDER_PROVIDER_TEST_TIMEOUT"
 _DEFAULT_PROVIDER_TEST_TIMEOUT = 10.0
 
+# 최근-window quality aggregate가 canonical manifest.json mtime으로 후보를 좁힐 때
+# 쓰는 여유분. mtime은 완료 시점에 만들어지는 정본 파일의 것이라 항상
+# finished_at 이상이지만, 완료 후 재기록(예: secret redaction)·시계 오차·파일시스템
+# mtime 해상도를 흡수하려 window 하한을 이만큼 더 내려 잡는다. 정확한 경계는
+# quality.aggregate_quality_window가 canonical timestamp로 다시 적용한다.
+_QUALITY_WINDOW_MTIME_MARGIN_SECONDS = 3600
+
+
 # /preview의 limit 방어적 상한 (#497). 기존에는 상한이 없었다 — Preview는 전체
-# dataset을 메모리에 올린 뒤 slice하므로 limit 자체가 fetch량을 줄이지는 않지만,
-# 응답에 실리는 sample/diff 크기는 이 값으로 명확히 bound한다. 값은 stage
-# preview의 기존 상한(MAX_STAGE_PREVIEW_LIMIT, service/stages.py)과 맞췄다.
-MAX_PREVIEW_LIMIT = 1000
-
-
 @runtime_checkable
 class _CloseableClient(Protocol):
     def close(self) -> None: ...
@@ -95,10 +124,15 @@ def _close_request_client(client: SourceClient) -> None:
         client.close()
 
 
+def _raise_provider_test_error(client: SourceClient, provider: str) -> None:
+    """provider_status의 client 생성 실패 fallback에서 쓰는 항상-raise operation."""
+    raise RuntimeError()
+
+
 def _credential_repository_from_env(output_root: Path) -> CredentialRepository | None:
     """master key가 설정된 경우에만 encrypted repository를 활성화한다.
 
-    백엔드는 KPUBDATA_BUILDER_STORAGE_BACKEND 를 따른다 (ADR 0013): cubrid 이면 전역
+    백엔드는 KPUBDATA_BUILDER_STORAGE_BACKEND 를 따른다 (ADR 0016): cubrid 이면 전역
     Engine 을 공유하는 CubridCredentialRepository, 아니면 기본 SQLite 파일.
     """
     encoded_key = os.environ.get(_CREDENTIAL_MASTER_KEY_ENV)
@@ -150,15 +184,120 @@ def _redact_json_secrets(value: object, secrets: Iterable[str]) -> object:
     return value
 
 
-def _authenticated_provider_names(client: SourceClient) -> frozenset[str]:
-    authenticated_providers = cast(Client, client).iter_authenticated_providers()
-    return frozenset(provider.name for provider in authenticated_providers)
+_SECRET_LIKE_PARAM_NAMES = frozenset(
+    {
+        "servicekey",
+        "service_key",
+        "apikey",
+        "api_key",
+        "key",
+        "secret",
+        "token",
+        "password",
+        "authkey",
+        "auth_key",
+    }
+)
 
 
-def _requires_service_key(dataset: DatasetRef, auth_provider_names: frozenset[str]) -> bool:
-    return dataset.provider in auth_provider_names or bool(
-        dataset.raw_metadata.get("service_key_param")
-    )
+def _catalog_request_parameters(dataset: DatasetRef) -> list[JsonValue]:
+    """``raw_metadata``의 요청 파라미터 설명을 secret-free allowlist로 직렬화한다.
+
+    UI가 필수 요청 파라미터를 사전에 안내하기 위한 최소 공개 metadata다
+    (``dataset.raw_metadata["request_parameters"]``, 없으면 빈 배열).
+
+    - ``dict`` 항목만, 비어 있지 않은 문자열 ``name`` 필수.
+    - ``service_key_param``과 secret-like 이름(serviceKey/apiKey/key/secret/
+      token/password 등)은 제외한다 — serviceKey/API key 입력을 user request
+      params로 요구하지 않는다.
+    - ``name``/``required``(bool)/``description``(str|None)/``example``(str|None)만
+      담는다. provider 내부 구현 세부는 노출하지 않는다.
+    """
+    raw = dataset.raw_metadata.get("request_parameters")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    service_key_param = str(dataset.raw_metadata.get("service_key_param", "")).strip().lower()
+    result: list[JsonValue] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name_raw = item.get("name")
+        if not isinstance(name_raw, str) or not name_raw.strip():
+            continue
+        name = name_raw.strip()
+        lowered = name.lower()
+        if lowered in _SECRET_LIKE_PARAM_NAMES:
+            continue
+        if service_key_param and lowered == service_key_param:
+            continue
+        description = item.get("description")
+        example = item.get("example")
+        result.append(
+            {
+                "name": name,
+                "required": bool(item.get("required", False)),
+                "description": description
+                if isinstance(description, str) and description
+                else None,
+                "example": example if isinstance(example, str) and example else None,
+            }
+        )
+    return result
+
+
+def _catalog_application(dataset: DatasetRef) -> JsonValue:
+    """``raw_metadata.application``을 secret-free allowlist로 직렬화한다.
+
+    공공데이터포털은 API Key 발급과 특정 Dataset 활용신청이 별개일 수 있다 —
+    ``dataset.raw_metadata["application"]``(``{"required": bool, "url": str}``)이
+    있으면 그대로 전달하고, 없으면 ``null``(활용신청 여부를 알 수 없음, "필요 없음"으로
+    단정하지 않는다). ``url``이 http(s) 스킴이 아니면 노출하지 않는다(임의 스킴 차단).
+    """
+    raw = dataset.raw_metadata.get("application")
+    if not isinstance(raw, dict):
+        return None
+    required = raw.get("required")
+    if not isinstance(required, bool):
+        return None
+    url = raw.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return {"required": required, "url": url}
+
+
+def _catalog_dataset_body(dataset: DatasetRef, requires_service_key: bool) -> dict[str, JsonValue]:
+    """DatasetRef의 public/canonical metadata만 allowlist로 직렬화한다 (#490).
+
+    ``raw_metadata``는 provider 내부 정보와 secret-like 값이 섞일 수 있어
+    절대 그대로 노출하지 않는다 — UI 탐색에 필요한 필드만 명시적으로 골라
+    담는다. metadata가 없는 dataset은 description/source_url/query_support가
+    null, tags/operations가 빈 배열로 직렬화된다(응답 전체를 깨지 않는다).
+    """
+    query_support: JsonValue = None
+    if dataset.query_support is not None:
+        query_support = {
+            "pagination": dataset.query_support.pagination.value,
+            "filterable_fields": cast(JsonValue, sorted(dataset.query_support.filterable_fields)),
+            "sortable_fields": cast(JsonValue, sorted(dataset.query_support.sortable_fields)),
+            "time_range": dataset.query_support.time_range,
+            "max_page_size": dataset.query_support.max_page_size,
+        }
+    return {
+        "name": dataset.dataset_key,
+        "title": dataset.name,
+        "description": dataset.description,
+        "tags": cast(JsonValue, sorted(dataset.tags)),
+        "source_url": dataset.source_url,
+        "representation": dataset.representation.value,
+        "operations": cast(JsonValue, sorted(op.value for op in dataset.operations)),
+        "query_support": query_support,
+        "requires_service_key": requires_service_key,
+        "request_parameters": cast(JsonValue, _catalog_request_parameters(dataset)),
+        "application": _catalog_application(dataset),
+    }
 
 
 def _enforce_ownership() -> bool:
@@ -212,12 +351,77 @@ def _strip_internal_fields(entries: list[_BuildListEntry]) -> list[_BuildListEnt
 # 1.4.0 -> 1.5.0: Dataset Catalog·Detail·Stage Summary API 추가 (#488, additive).
 # 1.5.0 -> 1.6.0: 구조화된 Quality/Schema Drift 결과, quality history/detail API 추가
 # (#486, additive — 기존 엔드포인트는 변경되지 않는다).
-# 1.8.0 -> 1.9.0: (1) POST /preview에 Source↔Silver diff와 sample_mode(first/random)
+# 1.8.0 -> 1.9.0: query startup/engine timing fields 추가 (#523, additive).
+# 1.9.0 -> 1.10.0: POST /preview에 Source↔Silver diff와 sample_mode(first/random)
 # 옵션 추가 (#497, additive — 기존 필드는 유지된다). limit 상한(1000) 신규 도입은
-# behavioral tightening(이전엔 상한 없음) — 그 이상 값은 400. (2) /query 응답에
-# child startup과 Polars engine 실행 시간 필드 추가 (#523, additive).
-# ServiceResponse/FileResponse 는 .responses 모듈로 이동했다(상단 import 참조).
-API_CONTRACT_VERSION = "1.9.0"
+# behavioral tightening(이전엔 상한 없음) — 그 이상 값은 400.
+# 1.10.0 -> 1.11.0: GET /monitoring/summary, GET /monitoring/builds 추가 (#516,
+# additive — 기존 엔드포인트는 변경되지 않는다). Async build queue/worker는
+# 기존 AsyncBuildExecutor/AsyncBuildJobRegistry(#511/#513)의 read-only
+# snapshot을 반영하며, 정상 runtime에서는 availability=available이다.
+# MonitoringSummaryResponse.status(healthy/degraded)는 required subsystem
+# availability로부터 계산되는 deterministic aggregate다(latency threshold
+# 미사용).
+# 1.11.0 -> 1.12.0: BuildSpec.composition(JoinSpec)과 POST /build 응답의
+# composition 키, manifest.composition(CompositionProvenance) 추가 (#506,
+# additive — 기존 필드/엔드포인트는 변경되지 않는다).
+# 1.12.0 -> 1.13.0: BuildSpec sources[]에 kind="file"/"url"을 추가하고 (기존
+# provider/dataset source는 kind="public_api"로 additive 해석), POST /uploads,
+# GET /uploads/{upload_id}, DELETE /uploads/{upload_id}를 추가한다(#498,
+# additive — 기존 엔드포인트/kind 없는 source는 변경되지 않는다). url source는
+# P0 범위(GET, Auth=None, https만 허용)로 SSRF를 방어하는 safe fetch를 거친다.
+# 1.13.0 -> 1.14.0: GET /builds/{run_id}/events를 추가한다(#496, additive —
+# 기존 엔드포인트는 변경되지 않는다). run/source fetch/medallion
+# stage(bronze/silver/gold/export)/quality checkpoint의 structured event
+# append-only timeline을 raw logger 파싱 없이 조회할 수 있다. limit/tail
+# query parameter는 bounded(기본 200, 상한 1000)이며 반환은 항상 chronological
+# ascending이다. Monitoring(#516)의 시스템 aggregate와는 역할이 분리된다 — 이
+# endpoint는 단일 run의 이벤트만 다룬다.
+# 1.14.0 -> 1.15.0: /catalog 응답(CatalogDataset)에 탐색용 metadata(description/
+# tags/source_url/representation/operations/query_support)를 추가한다(#490,
+# additive — 기존 필드는 유지되며 raw_metadata는 노출하지 않는다).
+# 1.15.0 -> 1.16.0: async build job 표면을 계약에 문서화한다 — POST /builds(202/200
+# idempotent/409/429)와 GET /builds/{run_id}(잡 상태 polling) 추가(#480). 잡 상태
+# 조회에 ownership 게이트를 적용해 cross-owner의 build 출력(response) 노출을
+# 차단한다(behavioral tightening — 이전에는 미검사).
+# 1.16.0 -> 1.17.0: build publish 표면을 추가한다(#491) — GET /builds/{run_id}/publish/
+# readiness와 POST /builds/{run_id}/publish(idempotent receipt, TOCTOU 재검사).
+# 1.17.0 -> 1.18.0: POST /builds/{run_id}/cancel을 추가한다(#481, ADR 0008 —
+# additive). queued job은 실행 전에 즉시 cancelled로, running job은 cancelling을
+# 거쳐 안전한 stage 경계에서 cancelled로 종결된다(강제 종료 없음). BuildJobStatus
+# 어휘(queued/running/cancelling/succeeded/failed/cancelled)는 그대로 재사용한다.
+# 함께 additive로: BuildManifest에 status/partial(부분 산출물 표시),
+# BuildEventName에 run_cancelled, BuildSummary.status enum에 cancelled(이미
+# BuildIndex/dataset 계약이 쓰던 값이 이제 실제로 관측 가능해진다).
+# 1.18.0 -> 1.19.0: publish receipt 운영 경로를 추가한다(#551, additive) —
+# GET /builds/{run_id}/publish/receipt(unknown 상태 조회),
+# POST /builds/{run_id}/publish/reconcile(원격 상태 확인 후 succeeded 확정 또는
+# reset으로 재게시 허용), DELETE /builds/{run_id}/publish/receipt(명시적 reset,
+# 감사 로그 기록). reconcile은 원격 판단 불가 시 503로 아무 것도 변경하지 않는다.
+# 1.19.0 -> 1.20.0: HTTP publish target에 kaggle과 local을 추가한다(#550,
+# additive). kaggle은 packaging의 dataset-metadata.json id가 destination과
+# 일치할 때만(readiness blocker로 정합 검증), local은
+# KPUBDATA_BUILDER_LOCAL_PUBLISH_ROOT로 지정한 publish-root 안의 상대
+# owner/name 경로로 한정된다. GET readiness의 destination query는 선택 파라미터다.
+# 1.20.0 -> 1.21.0: publish 감사 로그 조회를 추가한다(#563, additive) —
+# GET /builds/{run_id}/publish/audit(reconcile/reset 이력, 소유권 게이트).
+# 1.21.0 -> 1.22.0: Studio Home dashboard가 임의 숫자 합성 없이 authoritative
+# aggregate를 읽도록 두 가지 additive 조회를 추가한다(기존 필드/동작 불변):
+#   - GET /datasets 응답에 total — canonical grouping + ownership 필터 이후,
+#     pagination(limit) 이전의 distinct dataset 개수. items.length/limit을 total로
+#     오인하지 않도록 한다.
+#   - GET /quality/summary?window=24h — 최근 24h 안에서 접근 가능한 run의
+#     structured quality를 PASS/WARN/FAIL run 수로 요약(#486 도메인 quality의
+#     bounded cross-run aggregate). 시스템 observability(/monitoring)와 섞지 않는다.
+#   - GET /catalog 응답의 CatalogDataset에 request_parameters와 application(같은
+#     미머지 릴리스 범위의 additive — 기존 필드/동작 불변). raw_metadata의
+#     request_parameters를 secret-free allowlist(name/required/description/
+#     example)로 직렬화한 것으로, serviceKey 등 시크릿 파라미터는 제외된다. Add
+#     Data가 선택한 Dataset의 필수 요청 파라미터를 사전에 안내하는 데 쓴다.
+#     metadata가 없는 dataset은 빈 배열. application은 API Key 발급과 Dataset별
+#     활용신청이 별개일 수 있는 경우의 안내({required, url})로, raw_metadata에
+#     없으면 null(신청 완료/승인 여부를 Builder/Studio가 추측하지 않는다).
+API_CONTRACT_VERSION = "1.22.0"
 
 
 def _quality_result_to_json(r: QualityCheckResult) -> dict[str, JsonValue]:
@@ -236,12 +440,53 @@ def _quality_result_to_json(r: QualityCheckResult) -> dict[str, JsonValue]:
     }
 
 
+def _upload_metadata_body(metadata: UploadMetadata) -> dict[str, JsonValue]:
+    """UploadMetadata를 wire JSON으로 변환한다 (#498). content는 절대 포함하지 않는다."""
+    return {
+        "upload_id": metadata.upload_id,
+        "format": metadata.format,
+        "encoding": metadata.encoding,
+        "size_bytes": metadata.size_bytes,
+        "original_filename": metadata.original_filename,
+        "created_at": metadata.created_at,
+    }
+
+
 def _parse_spec_text(spec_yaml: str) -> BuildSpec:
     """YAML 텍스트를 BuildSpec으로 파싱한다."""
     raw = cast(object, yaml.safe_load(spec_yaml))
     if not isinstance(raw, dict):
         raise SpecLoadError("top-level YAML must be a mapping")
     return parse_spec(cast(dict[str, object], raw))
+
+
+def _publish_receipt_response(
+    claim_status: publish_service.PublishClaimStatus,
+    receipt: publish_service.PublishReceipt,
+) -> ServiceResponse | None:
+    """기존 receipt 상태를 replay/409 wire response로 변환한다."""
+    if claim_status == "claimed":
+        return None
+    if claim_status == "replay" and receipt.result is not None:
+        return ServiceResponse(200, cast(dict[str, JsonValue], receipt.result))
+    if claim_status == "replay":
+        claim_status = "state_unknown"
+    conflict_codes = {
+        "in_progress": (
+            "publish_in_progress",
+            "publish operation is already in progress",
+        ),
+        "state_unknown": (
+            "publish_state_unknown",
+            "publish operation outcome is unknown; automatic retry is blocked",
+        ),
+        "conflict": (
+            "publish_conflict",
+            "this run and destination were already published with different options",
+        ),
+    }
+    code, message = conflict_codes[claim_status]
+    return ServiceResponse(409, {"error": message, "code": code})
 
 
 class BuilderService:
@@ -254,6 +499,7 @@ class BuilderService:
         client_factory: Callable[..., SourceClient],
         query_service: QueryService | None = None,
         credential_repository: CredentialRepository | None = None,
+        upload_repository: UploadRepository | None = None,
         provider_test_operation: ProviderTestOperation = default_provider_test,
         provider_test_timeout: float | None = None,
         async_max_workers: int = 10,
@@ -261,8 +507,29 @@ class BuilderService:
     ) -> None:
         self._output_root = output_root
         self._client_factory = client_factory
-        self._build_index = make_build_index(output_root)  # #309, ADR 0003/0013
-        self._store = make_artifact_store(output_root)  # ADR 0010/0013 (manifest 정본)
+        self._build_index = make_build_index(output_root)  # #309, ADR 0003/0016
+        self._store = make_artifact_store(output_root)  # ADR 0010/0016 (manifest 정본)
+        # run event timeline 저장소(#496). `_upload_repository`와 동일하게 지연
+        # 생성한다 — preview는 build를 전혀 실행하지 않아 event를 남길 일이
+        # 없으므로("Preview writes no files" 기존 계약, #497 범위 밖 #496도
+        # 동일), 실제로 처음 쓰일 때(build/submit_build/events 조회)까지
+        # `_build_events.sqlite` 흔적을 남기지 않는다.
+        self._event_store_lazy: BuildEventStore | None = None
+        self._event_store_lock = threading.Lock()
+        # kind="file" source(#498)의 업로드 저장소. 명시적으로 주입되지 않으면
+        # 실제로 처음 쓰일 때까지 SQLite 파일을 만들지 않는다(지연 생성,
+        # `_upload_repository` property) — credential repository(마스터 키
+        # 미설정 시 None)처럼, 업로드 기능을 쓰지 않는 워크스페이스에는 흔적을
+        # 남기지 않는다(예: preview는 파일을 하나도 쓰지 않는다는 기존 계약).
+        self._upload_repository_override: UploadRepository | None = upload_repository
+        self._upload_repository_lazy: UploadRepository | None = None
+        self._upload_repository_lock = threading.Lock()
+        # Monitoring API용 bounded latency recorder (#516). dispatch()가 매 요청
+        # 처리 시간을 기록한다 — 인스턴스별로 분리해 테스트 간 상태가 섞이지 않는다.
+        self._latency_recorder = monitoring_service.LatencyRecorder()
+        # 외부 publish side effect의 durable idempotency receipt. 객체 생성은
+        # 파일을 만들지 않으며 최초 POST claim 때 SQLite를 지연 초기화한다.
+        self._publish_receipts = publish_service.PublishReceiptStore(output_root)
         self._query_service = query_service or QueryService()
         repository = credential_repository or _credential_repository_from_env(output_root)
         self._credential_resolver = CredentialResolver(repository)
@@ -278,7 +545,56 @@ class BuilderService:
         self._async_builds = AsyncBuildExecutor(
             max_workers=async_max_workers,
             max_queue_size=async_max_queue_size,
+            # running job이 안전 경계에서 실제로 cancelled로 종결되는 순간 정확히
+            # 한 번 호출된다 (#481). 종결 event는 job의 terminal 전이를 확정하는
+            # 쪽에서만 남겨, queued 취소와 running 취소가 똑같이 run_cancelled
+            # 하나로 끝나고 한 run에 종결 event가 둘 생기지 않는다.
+            on_cancelled=self._record_run_cancelled,
         )
+
+    @property
+    def _event_store(self) -> BuildEventStore:
+        """run event timeline 저장소를 지연 생성해 반환한다 (#496).
+
+        처음 접근될 때만 ``_build_events.sqlite``를 만든다 — preview만 하는
+        워크스페이스에는 흔적을 남기지 않는다(기존 "Preview writes no files"
+        계약과 동일한 이유로 지연 생성한다).
+        """
+        if self._event_store_lazy is None:
+            with self._event_store_lock:
+                if self._event_store_lazy is None:
+                    self._event_store_lazy = BuildEventStore(self._output_root)
+        return self._event_store_lazy
+
+    @property
+    def _upload_repository(self) -> UploadRepository:
+        """kind="file" source(#498)의 업로드 저장소를 지연 생성해 반환한다.
+
+        명시적으로 주입됐으면 그대로 쓴다. 아니면 처음 호출될 때만
+        SQLite 파일을 만든다 — preview/build가 업로드를 전혀 참조하지 않는
+        워크스페이스에는 ``.service/uploads.sqlite3`` 흔적을 남기지 않는다.
+        """
+        if self._upload_repository_override is not None:
+            return self._upload_repository_override
+        with self._upload_repository_lock:
+            if self._upload_repository_lazy is None:
+                self._upload_repository_lazy = SQLiteUploadRepository(
+                    self._output_root / ".service" / "uploads.sqlite3",
+                    max_bytes=resolve_max_upload_bytes(),
+                )
+            return self._upload_repository_lazy
+
+    def _upload_repository_for(self, spec: BuildSpec) -> UploadRepository | None:
+        """spec에 ``kind="file"`` source가 있을 때만 업로드 저장소를 만든다 (#498).
+
+        file source가 없는 preview/build는 이 property를 아예 건드리지 않아
+        지연 생성이 실제로 지연되게 한다 — property 자체를 호출하면(설령
+        결과를 안 쓰더라도) 매 요청마다 SQLite를 초기화하게 되므로 여기서
+        먼저 필요 여부를 가른다.
+        """
+        if any(source.kind == "file" for source in spec.sources):
+            return self._upload_repository
+        return None
 
     def _create_client(
         self,
@@ -314,8 +630,9 @@ class BuilderService:
         client = self._create_client()
         try:
             return provider_descriptors(client)
-        except Exception:
-            return ServiceResponse(502, {"error": "provider catalog unavailable"})
+        except Exception as exc:
+            logger.exception("provider catalog unavailable")
+            return ServiceResponse(502, {"error": f"catalog unavailable: {exc}"})
         finally:
             _close_request_client(client)
 
@@ -376,7 +693,7 @@ class BuilderService:
                 provider=provider,
                 configured=True,
                 client=cast(SourceClient, object()),
-                operation=lambda _client, _provider: (_ for _ in ()).throw(RuntimeError()),
+                operation=_raise_provider_test_error,
             )
             return ServiceResponse(200, cast(dict[str, JsonValue], test_result_body(result)))
         finally:
@@ -451,6 +768,63 @@ class BuilderService:
             {"provider": provider, "configured": False, "masked": None, "updated_at": None},
         )
 
+    def create_upload(
+        self,
+        raw: bytes,
+        *,
+        format: str,  # noqa: A002 - 계약 필드명과 맞춘다
+        encoding: str,
+        original_filename: str | None,
+        principal: Principal,
+    ) -> ServiceResponse:
+        """업로드 content를 저장하고 즉시 파싱 가능한지 검증한다 (#498).
+
+        저장은 owner_id로 격리된다 — 나중에 BuildSpec의 ``kind="file"`` source가
+        이 upload_id를 참조하려면 같은 principal이어야 한다(``build``/``preview``의
+        resolver가 다시 확인한다). 파싱 가능성은 여기서 fail-fast로 확인한다 —
+        나중에 build 시점에야 손상된 파일임을 알게 되는 것을 피한다.
+        """
+        if principal.owner_id is None:
+            return ServiceResponse(403, {"error": "stable principal is required"})
+        if format not in SOURCE_FILE_FORMATS:
+            return ServiceResponse(
+                400,
+                {"error": f"format must be one of {SOURCE_FILE_FORMATS}, got {format!r}"},
+            )
+        try:
+            _ = parse_tabular_bytes(raw, format=format, encoding=encoding)
+        except IngestionError as exc:
+            return ServiceResponse(400, {"error": str(exc)})
+        try:
+            metadata = self._upload_repository.put(
+                principal.owner_id,
+                content=raw,
+                format=format,
+                encoding=encoding,
+                original_filename=original_filename,
+            )
+        except ValueError as exc:
+            return ServiceResponse(400, {"error": str(exc)})
+        return ServiceResponse(200, _upload_metadata_body(metadata))
+
+    def get_upload(self, upload_id: str, *, principal: Principal) -> ServiceResponse:
+        """현재 principal 소유 업로드의 안전한 메타데이터만 반환한다 (content 제외)."""
+        if principal.owner_id is None:
+            return ServiceResponse(403, {"error": "stable principal is required"})
+        metadata = self._upload_repository.get_metadata(principal.owner_id, upload_id)
+        if metadata is None:
+            return ServiceResponse(404, {"error": f"upload not found: {upload_id}"})
+        return ServiceResponse(200, _upload_metadata_body(metadata))
+
+    def delete_upload(self, upload_id: str, *, principal: Principal) -> ServiceResponse:
+        """현재 principal 소유 업로드만 삭제한다."""
+        if principal.owner_id is None:
+            return ServiceResponse(403, {"error": "stable principal is required"})
+        deleted = self._upload_repository.delete(principal.owner_id, upload_id)
+        if not deleted:
+            return ServiceResponse(404, {"error": f"upload not found: {upload_id}"})
+        return ServiceResponse(200, {"upload_id": upload_id, "deleted": True})
+
     def query(
         self, body: Mapping[str, JsonValue] | None, *, principal: Principal
     ) -> ServiceResponse:
@@ -507,39 +881,34 @@ class BuilderService:
     def catalog(self) -> ServiceResponse:
         """사용 가능한 provider/dataset 카탈로그를 반환한다 (#416, BL2, #436).
 
-        kpubdata Client의 공개 ``datasets.list()`` 로 모든 데이터셋을 조회한 뒤
-        provider별로 그룹화한다 (ADR 0011 — Builder가 provider 목록을
+        kpubdata Client의 provider별 공개 ``datasets.list(provider=...)``로 데이터셋을
+        조회한다. KRX의 명시된 optional pandas 누락만 격리하고 다른 오류는 실패로
+        드러낸다. Provider 목록은 runtime registry에서 얻는다 (ADR 0011 — Builder가
         하드코딩하지 않는다). 이전에는 ``getattr(client, "_catalog")`` private
         접근 + 8개 provider 하드코딩 튜플을 써서 kpubdata에 provider가 추가돼도
         카탈로그에 안 떴다 (#436). 시크릿 값은 노출하지 않고 필요 여부만 표시한다.
         """
         client = self._create_client()
         try:
-            all_datasets = cast(Client, client).datasets.list()
-            auth_provider_names = _authenticated_provider_names(client)
+            runtime_catalog = runtime_provider_catalog(client)
         except Exception as exc:
             return ServiceResponse(502, {"error": f"catalog unavailable: {exc}"})
         finally:
             _close_request_client(client)
 
-        # provider별 그룹화 (등록 순서 보존 위해 dict 사용).
-        grouped: dict[str, list[DatasetRef]] = {}
-        for ds in all_datasets:
-            grouped.setdefault(ds.provider, []).append(ds)
-
         providers_data: list[JsonValue] = [
             {
-                "name": provider_name,
+                "name": item.descriptor.name,
                 "datasets": [
-                    {
-                        "name": item.dataset_key,
-                        "title": item.name,
-                        "requires_service_key": _requires_service_key(item, auth_provider_names),
-                    }
-                    for item in items
+                    _catalog_dataset_body(
+                        dataset,
+                        item.descriptor.requires_credential
+                        or bool(dataset.raw_metadata.get("service_key_param")),
+                    )
+                    for dataset in item.datasets
                 ],
             }
-            for provider_name, items in grouped.items()
+            for item in runtime_catalog
         ]
         return ServiceResponse(200, {"providers": providers_data})
 
@@ -589,7 +958,12 @@ class BuilderService:
         if isinstance(spec_or_error, ServiceResponse):
             return spec_or_error
 
-        provider_names = tuple(source.provider for source in spec_or_error.sources)
+        # provider credential은 kind="public_api" source에만 의미가 있다(#498) —
+        # file/url source의 provider는 항상 빈 문자열이므로 섞으면 credential
+        # resolver에 의미 없는 provider 이름이 전달된다.
+        provider_names = tuple(
+            source.provider for source in spec_or_error.sources if source.kind == "public_api"
+        )
         try:
             provider_keys = (
                 self._credential_resolver.provider_keys(principal.owner_id, provider_names)
@@ -612,6 +986,8 @@ class BuilderService:
                 limit=limit,
                 sample_mode=cast(SampleMode, sample_mode),
                 seed=seed,
+                upload_repository=self._upload_repository_for(spec_or_error),
+                owner_id=principal.owner_id if principal is not None else None,
             )
         finally:
             _close_request_client(client)
@@ -676,7 +1052,10 @@ class BuilderService:
         run_id: str | None = None,
         created_by: str | None = None,
         owner_id: str | None = None,
+        manifest_owner_id: str | None = None,
+        credential_owner_id: str | None = None,
         principal: Principal | None = None,
+        cancellation: CancellationProbe | None = None,
     ) -> ServiceResponse:
         """파이프라인을 실행하고 결과를 반환한다.
 
@@ -689,16 +1068,42 @@ class BuilderService:
         ``owner_id``는 canonical stable owner identity다(#505). ``created_by``는
         기존(#388) display/legacy 라벨로 계속 함께 기록된다 — wire 계약은 바뀌지
         않는다.
+
+        ``manifest_owner_id``는 persisted manifest ownership(및 그 manifest를
+        읽어 채우는 BuildIndex, #505 SSOT)에만 쓰이는 별도 값이다 — ``owner_id``
+        (kind="file" source resolver의 업로드 소유권 확인용, #498)와 분리하기
+        위한 것으로, 생략하면 ``owner_id``를 그대로 쓴다(기존 동작과 동일).
+        async run(``_run_build_job``)이 이 필드로 submitting principal의
+        owner_id를 manifest/BuildIndex에는 기록하면서도 file resolver에는
+        여전히 owner_id를 넘기지 않는 데 쓴다(#496 follow-up).
+
+        ``credential_owner_id``는 async worker가 submitting principal의 stable
+        identity로 public_api credential만 해석하기 위한 내부 값이다. file source
+        resolver에는 전달하지 않으며, request principal이 있으면 principal의
+        owner_id가 항상 우선한다(ADR 0012, ADR 0014).
+
+        ``cancellation``은 async job(#481)에서만 전달되는 협력적 취소 probe다.
+        ``None``이면(동기 ``POST /build``, CLI) 파이프라인이 취소 점검을 전혀
+        하지 않아 기존 동작과 100% 동일하다 — 동기 build에 취소 상태를 강요하지
+        않는다. 취소로 끝난 run은 409와 함께 ``status="cancelled"`` 요약을
+        반환하는데, 이 응답은 async worker(``AsyncBuildExecutor._run``)만 보고
+        job snapshot에도 실리지 않으므로 HTTP wire에는 노출되지 않는다 —
+        부분 산출물의 정본은 partial manifest다.
         """
         spec_or_error = self._load_validated(spec_yaml)
         if isinstance(spec_or_error, ServiceResponse):
             return spec_or_error
 
-        provider_names = tuple(source.provider for source in spec_or_error.sources)
+        # provider credential은 kind="public_api" source에만 의미가 있다(#498) —
+        # file/url source의 provider는 항상 빈 문자열이다.
+        provider_names = tuple(
+            source.provider for source in spec_or_error.sources if source.kind == "public_api"
+        )
+        provider_owner_id = principal.owner_id if principal is not None else credential_owner_id
         try:
             provider_keys = (
-                self._credential_resolver.provider_keys(principal.owner_id, provider_names)
-                if principal is not None
+                self._credential_resolver.provider_keys(provider_owner_id, provider_names)
+                if principal is not None or credential_owner_id is not None
                 else {}
             )
             client = self._create_client(
@@ -718,6 +1123,10 @@ class BuilderService:
                 run_id=run_id,
                 created_by=created_by,
                 owner_id=owner_id,
+                manifest_owner_id=manifest_owner_id,
+                upload_repository=self._upload_repository_for(spec_or_error),
+                event_store=self._event_store,
+                cancellation=cancellation,
             )
         finally:
             _close_request_client(client)
@@ -742,21 +1151,42 @@ class BuilderService:
             }
             for outcome in result.outcomes
         ]
-        status_code = 200 if result.status == "ok" else 502
+        # 취소된 run(#481)은 성공도 실패도 아니다. 이 응답은 async worker만 보고
+        # job snapshot(BuildJob.response)에도 실리지 않으므로 wire 계약(200/502)을
+        # 넓히지 않는다 — outcomes도 싣지 않아 SourceOutcome enum(ok/failed)과
+        # 어긋나지 않는다. 부분 산출물의 정본은 아래에서 이미 기록된 partial
+        # manifest다.
+        cancelled = result.status == "cancelled"
+        status_code = 200 if result.status == "ok" else 409 if cancelled else 502
         body: dict[str, JsonValue] = {
             "status": result.status,
             "run_id": result.context.run_id,
-            "outcomes": outcomes,
             "manifest": str(result.manifest_path),
             "api_version": API_CONTRACT_VERSION,
         }
+        if not cancelled:
+            body["outcomes"] = outcomes
+        # composition(#506) 결과는 outcomes(소스별)와 별도로 노출한다 — bronze/silver/gold
+        # stage 개념이 없고 "combined result"로 명확히 구분되어야 하기 때문이다.
+        # BuildSpec.composition이 없으면 null이다.
+        if result.composition_outcome is not None:
+            body["composition"] = {
+                "name": result.composition_outcome.name,
+                "status": result.composition_outcome.status,
+                "error": _redact_secret_text(result.composition_outcome.error, secret_values),
+            }
+        else:
+            body["composition"] = None
         # 실패한 빌드는 첫 번째 실패 outcome의 error를 최상위 `error` 요약으로 노출해,
         # Studio 같은 소비자가 outcomes 배열을 파싱하지 않고도 사람이 읽을 수 있는
-        # 사유를 즉시 표면화할 수 있게 한다 (#226).
-        if result.status != "ok":
+        # 사유를 즉시 표면화할 수 있게 한다 (#226). composition만 실패하고 모든 source가
+        # 성공한 경우도 놓치지 않도록 composition_outcome도 함께 살핀다 (#506).
+        if result.status == "failed":
             first_error = next(
                 (o.error for o in result.outcomes if o.status != "ok" and o.error), None
             )
+            if first_error is None and result.composition_outcome is not None:
+                first_error = result.composition_outcome.error
             body["error"] = _redact_secret_text(first_error, secret_values) or "build failed"
 
         # ADR 0003: 빌드 완료 후 인덱스 갱신 (best-effort, 실패해도 빌드 성공 유지)
@@ -776,7 +1206,7 @@ class BuilderService:
                 # (snapshot과 동일한 값) — 파생 검색값일 뿐이므로 별도로 추측하지 않는다 (#488).
                 dataset_id=spec_or_error.dataset_id,
             )
-            # ADR 0013: manifest 문서를 authoritative store 로 승격한다. sqlite/local 은
+            # ADR 0016: manifest 문서를 authoritative store 로 승격한다. sqlite/local 은
             # FS 파일이 정본이라 동일 내용 재기록(무해), cubrid 는 CUBRID 행 정본 + FS 미러.
             # best-effort — FS 에 이미 정본/미러가 있으므로 승격 실패가 빌드를 실패시키지 않는다.
             self._store.put_manifest(result.context.run_id, manifest_data)
@@ -787,9 +1217,24 @@ class BuilderService:
         return ServiceResponse(status_code, body)
 
     def submit_build(
-        self, spec_yaml: str, *, run_id: str | None = None, created_by: str | None = None
+        self,
+        spec_yaml: str,
+        *,
+        run_id: str | None = None,
+        created_by: str | None = None,
+        owner_id: str | None = None,
     ) -> ServiceResponse:
-        """비동기 build job을 큐에 넣고 초기 상태를 반환한다 (#482)."""
+        """비동기 build job을 큐에 넣고 초기 상태를 반환한다 (#482).
+
+        ``owner_id``는 job registry snapshot에 보존된다 — wire 응답
+        (``to_body()``)에는 노출되지 않는다. registry에 남은 이 값은 두 곳에
+        쓰인다: (1) active run(``check_active_run_access``, #496 follow-up)
+        ownership 판정, (2) ``_run_build_job``이 이를 ``build()``의
+        ``manifest_owner_id``로 넘겨 persisted manifest/BuildIndex(#505 SSOT)
+        에 정확한 owner_id를 기록. ``build()``의 ``owner_id``(``kind="file"``
+        source resolver용, #498)에는 여전히 전달하지 않는다 — async
+        file-backed source owner propagation 한계는 그대로 유지된다.
+        """
         resolved_run_id = run_id or generate_run_id()
         if self._build_index.get(resolved_run_id) is not None:
             return ServiceResponse(
@@ -799,12 +1244,76 @@ class BuilderService:
                     "run_id": resolved_run_id,
                 },
             )
-        result = self._async_builds.submit(
-            spec_yaml=spec_yaml,
-            run_id=resolved_run_id,
-            created_by=created_by,
-            runner=self._run_build_job,
-        )
+
+        def _record_run_submitted() -> None:
+            # AsyncBuildExecutor.submit()이 job을 worker pool에 큐잉하기 *전에*
+            # 호출된다(#496) — "existing"/"queue_full"이면 새 submission이 아니므로
+            # 아예 호출되지 않는다. store.append()는 실패를 삼키지 않고 그대로
+            # 전파한다(BuildEventStore, event timeline의 유일한 정본) — 여기서는
+            # 그 전파를 그대로 둔다. job이 아직 큐잉되지 않은 시점이라, 이 event가
+            # 기록되지 못하면 job도 만들어지지 않는다: "event는 유실됐는데 job은
+            # 이미 실행 중"이라는 모순이 생기지 않는다(recorder의 흡수 정책과
+            # 달리, 여기는 아직 다른 정본을 침범할 real side effect가 없다).
+            self._event_store.append(
+                BuildEvent(
+                    seq=0,
+                    timestamp=datetime.now(tz=timezone.utc),
+                    run_id=resolved_run_id,
+                    event="run_submitted",
+                    status="ok",
+                    message="build accepted for async execution",
+                )
+            )
+
+        def _record_enqueue_failure() -> None:
+            # registry.mark_failed() 직후, 예외 재전파 *전에* 호출된다(#496
+            # lifecycle 계약: timeline 자체도 이 실패를 표현해야 한다) —
+            # run_submitted는 이미 기록됐으니 지우지 않고(append-only), 기존
+            # "run_failed" vocabulary로 동일 run_id에 종결 event를 하나 더
+            # 남긴다. raw exception/stack trace는 담지 않는다 — bounded,
+            # 안전한 고정 message만 쓴다(recorder의 다른 event들과 동일한
+            # 방어 원칙). 이 append 자체가 실패해도 로그만 남기고 흡수한다 —
+            # 이미 registry가 "failed"로 확정된 뒤라, 이 부가 event 기록
+            # 실패가 원래 enqueue 실패(재전파될 예외)를 가리면 안 된다.
+            try:
+                self._event_store.append(
+                    BuildEvent(
+                        seq=0,
+                        timestamp=datetime.now(tz=timezone.utc),
+                        run_id=resolved_run_id,
+                        event="run_failed",
+                        status="fail",
+                        message="build could not be queued for execution",
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "failed to record run_failed event after enqueue failure (run_id=%s)",
+                    resolved_run_id,
+                    exc_info=True,
+                )
+
+        try:
+            result = self._async_builds.submit(
+                spec_yaml=spec_yaml,
+                run_id=resolved_run_id,
+                created_by=created_by,
+                owner_id=owner_id,
+                runner=self._run_build_job,
+                on_accept=_record_run_submitted,
+                on_enqueue_failure=_record_enqueue_failure,
+            )
+        except Exception:
+            # run_submitted event append 실패, 또는 event는 기록됐지만 이후
+            # worker pool 큐잉(executor.submit) 자체가 실패한 경우 둘 다
+            # 여기로 온다 — 두 경우 모두 job은 실행되지 않으므로 202를 주지
+            # 않는다(#496).
+            logger.error(
+                "failed to accept build submission; build was not queued (run_id=%s)",
+                resolved_run_id,
+                exc_info=True,
+            )
+            return ServiceResponse(500, {"error": "failed to accept build submission"})
         match result.status:
             case "accepted":
                 if result.snapshot is None:
@@ -830,10 +1339,96 @@ class BuilderService:
             return ServiceResponse(404, {"error": f"build job not found: {run_id}"})
         return ServiceResponse(200, snapshot.to_body())
 
+    def cancel_build(self, run_id: str) -> ServiceResponse:
+        """active(queued/running) async build job의 취소를 요청한다 (#481).
+
+        호출 전에 route가 run_id 형식 검증과 ownership 게이팅을 끝내 놓아야 한다
+        (``routes/builds.py`` — ``GET /builds/{run_id}``와 동일한 canonical 규칙).
+
+        응답은 registry의 원자적 판정(``request_cancel``) 하나로 결정되므로
+        경합과 무관하게 결정적이다.
+
+        - ``queued`` → 즉시 ``cancelled``(runner를 한 번도 실행하지 않는다), 200.
+        - ``running`` → ``cancelling``, 200. 실제 종결은 다음 안전 경계다.
+        - 이미 ``cancelling``/``cancelled`` → 200(멱등, 현재 snapshot 그대로).
+        - ``succeeded``/``failed``이거나 pipeline이 이미 정상 종료로 확정한 job
+          → 409. 새 오류 어휘를 만들지 않고 기존 conflict 관례를 쓴다
+          (``POST /builds``의 "이미 완료된 run_id" 409와 같은 의미의 충돌이다).
+        - registry가 모르는 run → 404 (``GET /builds/{run_id}``와 동일 메시지).
+        """
+        outcome, snapshot = self._async_builds.request_cancel(run_id)
+        if outcome == "unknown" or snapshot is None:
+            return ServiceResponse(404, {"error": f"build job not found: {run_id}"})
+        if outcome == "terminal":
+            return ServiceResponse(
+                409,
+                {
+                    "error": "build job is no longer cancellable",
+                    "run_id": run_id,
+                    "status": snapshot.status,
+                },
+            )
+        if outcome == "cancelled":
+            # queued job은 여기서 이미 종결됐다 — worker는 runner를 실행하지
+            # 않는다(``AsyncBuildExecutor._run``의 ``begin_run`` 게이트). 종결
+            # event는 running 경로와 동일하게 terminal 전이 시점에 한 번 남긴다.
+            self._record_run_cancelled(run_id)
+        return ServiceResponse(200, snapshot.to_body())
+
+    def _record_run_cancelled(self, run_id: str) -> None:
+        """cancelled 종결 event를 남긴다 (#481). 실패해도 전파하지 않는다.
+
+        job은 이 시점에 이미 ``cancelled``로 확정돼 있다 — event append 실패가
+        확정된 종단 상태를 되돌릴 수는 없으므로, ``_record_enqueue_failure``와
+        동일하게 로그만 남기고 흡수한다. worker thread에서도 호출되므로 예외를
+        전파하면 안 된다. message는 고정 문자열이며 raw exception/경로/자격증명을
+        담지 않는다.
+        """
+        try:
+            self._event_store.append(
+                BuildEvent(
+                    seq=0,
+                    timestamp=datetime.now(tz=timezone.utc),
+                    run_id=run_id,
+                    event="run_cancelled",
+                    status="ok",
+                    message="build cancelled at a safe stage boundary",
+                )
+            )
+        except Exception:
+            logger.error("failed to record run_cancelled event (run_id=%s)", run_id, exc_info=True)
+
     def _run_build_job(
-        self, spec_yaml: str, run_id: str, created_by: str | None
+        self,
+        spec_yaml: str,
+        run_id: str,
+        created_by: str | None,
+        cancellation: CancellationProbe,
     ) -> ServiceResponse:
-        return self.build(spec_yaml, run_id=run_id, created_by=created_by)
+        """async job registry가 부르는 실제 실행 진입점 (#482, #496 follow-up).
+
+        ``build()``에 file resolver용 ``owner_id``는 전달하지 않는다(``None`` 그대로) —
+        ``kind="file"`` source resolver는 async 경로에서 여전히 stable owner
+        identity를 알지 못한다(#498 async limitation 유지). registry snapshot에
+        이미 보존된(``submit_build``가 채운) submitting principal의 owner_id는
+        public_api credential 해석용 ``credential_owner_id``와 persisted manifest
+        ownership용 ``manifest_owner_id``로만 넘긴다 — persisted manifest
+        (및 그 manifest를 그대로 읽어 채우는 BuildIndex, #505 SSOT)는
+        ``build()`` 내부에서 단 한 번의 write로 정확한 owner_id를 갖게 되고,
+        build 종료 후 manifest를 별도로 사후 수정할 필요가 없다.
+        """
+        snapshot = self._async_builds.get(run_id)
+        manifest_owner_id = snapshot.owner_id if snapshot is not None else None
+        return self.build(
+            spec_yaml,
+            run_id=run_id,
+            created_by=created_by,
+            manifest_owner_id=manifest_owner_id,
+            credential_owner_id=manifest_owner_id,
+            # 협력적 취소 probe(#481)를 그대로 pipeline까지 내려보낸다 — service
+            # 개념(registry/HTTP/Principal)은 pipeline domain으로 넘기지 않는다.
+            cancellation=cancellation,
+        )
 
     def artifacts(self, run_id: str) -> ServiceResponse:
         """실행 워크스페이스의 산출물 파일 목록을 반환한다."""
@@ -847,8 +1442,11 @@ class BuilderService:
         if not run_dir.exists():
             return ServiceResponse(404, {"error": f"run not found: {run_id}"})
 
+        # wire에는 항상 run 디렉터리 기준 POSIX 상대 경로만 노출한다 — output_root 절대
+        # 경로나 OS별 구분자를 드러내지 않는다. `serve_artifact_file`이 받는 canonical
+        # artifact identifier가 바로 이 값이다(클라이언트는 storage layout을 알 필요 없다).
         files = sorted(
-            str(path.relative_to(run_dir)) for path in run_dir.rglob("*") if path.is_file()
+            path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()
         )
         return ServiceResponse(200, {"run_id": run_id, "files": list(files)})
 
@@ -864,7 +1462,7 @@ class BuilderService:
         except ValueError as exc:
             return ServiceResponse(400, {"error": str(exc)})
 
-        # ADR 0013: manifest 정본은 store 를 통해 조회한다(cubrid=CUBRID 행 우선, FS 폴백;
+        # ADR 0016: manifest 정본은 store 를 통해 조회한다(cubrid=CUBRID 행 우선, FS 폴백;
         # local=FS). get_manifest 는 경로 안전·손상·미존재를 모두 None 으로 합친다.
         manifest = self._store.get_manifest(run_id)
         if manifest is None:
@@ -929,14 +1527,29 @@ class BuilderService:
         if not run_dir.exists():
             return ServiceResponse(404, {"error": f"run not found: {run_id}"})
 
-        # file_path 검증 (경로 트래버설 방지)
+        # file_path 검증 (경로 트래버설 방지).
+        #
+        # canonical artifact identifier는 `GET /artifacts/{run_id}`가 돌려주는 run
+        # 디렉터리 기준 POSIX 상대 경로(예: "silver/datago.air_quality/table.parquet")다.
+        # HTTP 라우트는 이 경로를 URL segment 사이의 "/"로만 넘기고 각 segment는 percent
+        # 인코딩될 수 있으므로(브라우저가 non-ASCII/특수문자를 %XX로 바꾼다), 먼저 한 번
+        # percent-decode한다. decode 후에는 반드시 다시 검증한다 — "%2e%2e"/"%2f"/"%5c"
+        # 같은 인코딩된 트래버설이 decode되어 성분 검사에 걸리고, 이중 인코딩("%252e")은
+        # decode 후에도 "%"가 남아 성분 규칙에서 거부된다.
+        decoded_path = unquote(file_path)
+        segments = decoded_path.replace("\\", "/").split("/")
+        if not decoded_path.strip() or any(seg in ("", ".", "..") for seg in segments):
+            return ServiceResponse(
+                400, {"error": f"file_path is not a safe relative path: {file_path!r}"}
+            )
         try:
-            validate_path_segment(file_path, field_name="file_path")
+            for segment in segments:
+                validate_path_segment(segment, field_name="file_path")
         except ValueError as exc:
             return ServiceResponse(400, {"error": str(exc)})
 
-        # 요청된 파일의 전체 경로 계산
-        requested_file = run_dir / file_path
+        # 요청된 파일의 전체 경로 계산 (성분 검증을 통과한 상대 경로만 결합)
+        requested_file = run_dir.joinpath(*segments)
         # 경로가 run_dir 내에 있는지 확인 (심볼릭 링크도 해석하여 안전 검사)
         ensure_within(run_dir, requested_file, label="artifact file")
 
@@ -1009,7 +1622,10 @@ class BuilderService:
             fs_builds.append(
                 {
                     "run_id": run_dir.name,
-                    "status": "failed" if manifest.get("errors") else "ok",
+                    # manifest.json이 정본이므로 파생 규칙은 한 곳에만 둔다
+                    # (#481) — cancelled run은 errors가 비어 있을 수 있어
+                    # 기존 "errors 유무" 파생만으로는 ok로 잘못 보고된다.
+                    "status": status_from_manifest(manifest),
                     "started_at": manifest.get("started_at"),
                     "finished_at": manifest.get("finished_at"),
                     "created_by": manifest.get("created_by"),
@@ -1039,6 +1655,53 @@ class BuilderService:
             record for record in self._dataset_records(principal) if record.dataset_id == dataset_id
         ]
 
+    def _recent_canonical_records(
+        self, principal: Principal | None, *, now: datetime, window_seconds: int
+    ) -> list[datasets_service.RunRecord]:
+        """최근 ``window_seconds`` 안 candidate run을 canonical 정본으로 확정한다 (#488 후속 리뷰).
+
+        candidate run_id는 두 신호의 합집합이다:
+          - canonical ``manifest.json``의 mtime이 window 안(margin 포함)인 run.
+            mtime은 run 완료 시 만들어지는 정본 파일 자체의 것이라 항상
+            ``manifest.finished_at`` 이상이므로 window 안 run을 떨어뜨리지 않고,
+            ``stat``만 하므로 historical manifest/snapshot을 파싱하지 않는다.
+          - ``BuildIndex.list_between``의 window 안 run (파생 index fast lookup).
+
+        BuildIndex는 파생 검색 index이고 write는 best-effort다 (ADR 0003: "권위
+        없음", manifest와의 reconcile 시점 미정) — 누락되거나 stale한 row가 정본
+        24h aggregate를 바꾸면 안 되므로, index 단독으로 좁히지 않고 위 mtime
+        후보로 보강한다. index 조회가 실패해도 mtime 후보가 이미 전체를 커버한다.
+
+        확정된 candidate만 snapshot+manifest로 재검증하며(``canonical_records_for_run_ids``),
+        정확한 ``(now-window, now]`` 경계와 ``finished_at``/``started_at`` fallback,
+        ownership은 그 canonical 값으로 이후 단계(``aggregate_quality_window`` /
+        ``filter_ownership``)에서 적용한다.
+        """
+        margin_seconds = window_seconds + _QUALITY_WINDOW_MTIME_MARGIN_SECONDS
+        mtime_cutoff = now.timestamp() - margin_seconds
+        candidate_run_ids: set[str] = set()
+        if self._output_root.exists():
+            for run_dir in self._output_root.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                try:
+                    manifest_mtime = (run_dir / "manifest.json").stat().st_mtime
+                except OSError:
+                    continue  # manifest 부재/접근 불가 — 완료된 run 아님
+                if manifest_mtime >= mtime_cutoff:
+                    candidate_run_ids.add(run_dir.name)
+        lower = (now - timedelta(seconds=margin_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        upper = (now + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 파생 index 조회가 실패해도 mtime 후보가 이미 전체 run을 커버한다.
+        with suppress(Exception):
+            candidate_run_ids.update(
+                entry.run_id for entry in self._build_index.list_between(lower, upper)
+            )
+        canonical = datasets_service.canonical_records_for_run_ids(
+            self._output_root, candidate_run_ids
+        )
+        return datasets_service.filter_ownership(canonical, principal, enforce=_enforce_ownership())
+
     def list_datasets(
         self, *, limit: int = 50, principal: Principal | None = None
     ) -> ServiceResponse:
@@ -1047,6 +1710,10 @@ class BuilderService:
         각 dataset은 접근 가능한 run 중 latest run(finished_at 기준, 동일 시각은
         run_id 내림차순 타이브레이크)의 canonical snapshot·manifest·stage 상태로
         요약된다. legacy run(snapshot 없음)은 grouping 대상에서 제외된다.
+
+        `total`은 canonical grouping + ownership 필터 이후, pagination(limit) 이전의
+        distinct dataset 개수다(#488 후속, additive) — limit이 무한이면 `datasets`에
+        실릴 항목 수와 같다. 다른 principal 소유 run만 있는 dataset은 포함되지 않는다.
         """
         records = self._dataset_records(principal)
         latest_by_dataset = datasets_service.group_latest_by_dataset(records)
@@ -1055,14 +1722,24 @@ class BuilderService:
             key=datasets_service.sort_key,
             reverse=True,
         )
+        # total은 canonical/renderable dataset 개수이므로, expensive full summary
+        # (snapshot+manifest+stage 산출물 probe)는 응답 page(limit)에 실릴 후보에만
+        # 수행한다. page를 채운 뒤로는 total 카운트를 위한 경량 renderability 검증만
+        # 한다 — legacy/손상으로 canonical summary를 만들 수 없는 run은 목록에서도
+        # total에서도 동일하게 제외된다(#488 후속 리뷰: limit=1 + 대량 dataset에서
+        # catalog 전체에 full summary가 도는 regression 방지).
         items: list[JsonValue] = []
+        total = 0
         for record in ordered:
-            if len(items) >= limit:
-                break
-            view = datasets_service.build_dataset_summary(self._output_root, record)
-            if view is not None:
+            if len(items) < limit:
+                view = datasets_service.build_dataset_summary(self._output_root, record)
+                if view is None:
+                    continue
                 items.append(view)
-        return ServiceResponse(200, {"datasets": items})
+                total += 1
+            elif datasets_service.dataset_summary_renderable(self._output_root, record):
+                total += 1
+        return ServiceResponse(200, {"datasets": items, "total": total})
 
     def get_dataset(
         self, dataset_id: str, *, principal: Principal | None = None
@@ -1158,6 +1835,167 @@ class BuilderService:
             },
         )
 
+    def quality_summary(
+        self, *, window: str, principal: Principal | None = None
+    ) -> ServiceResponse:
+        """최근 ``window`` 안 접근 가능한 run의 structured quality를 PASS/WARN/FAIL
+        run 수로 요약한다 (#486 후속, additive — API 1.22.0).
+
+        Studio Home의 "QUALITY WARN (24H)" KPI가 임의 숫자 합성 없이 authoritative
+        aggregate를 읽도록 하는 bounded cross-run 집계다. 개별 run의
+        ``quality_results``/dataset/owner는 노출하지 않는다 — 그건 per-run
+        ``GET /builds/{run_id}/quality``의 몫이다. 시스템 observability
+        (``/monitoring``)와 도메인 quality를 한 응답에 섞지 않는다.
+
+        run 집합은 ``_recent_canonical_records``로 얻는다 — canonical
+        ``manifest.json`` mtime(+ 파생 BuildIndex 시간창)으로 24h candidate를
+        좁힌 뒤 그 candidate만 canonical snapshot + manifest로 재확인하고
+        (ENFORCE_OWNERSHIP + oidc principal이면 본인 run만), all-history manifest
+        재파싱은 하지 않는다. index는 파생물이라 단독으로 신뢰하지 않는다(ADR 0003).
+        새로운 run 인덱스를 만들지 않는다. legacy run(snapshot 없음)은 애초에
+        structured quality가 없으므로 자연히 제외된다.
+        """
+        if window != "24h":
+            return ServiceResponse(400, {"error": f"unsupported window: {window!r} (only '24h')"})
+        now = datetime.now(timezone.utc)
+        base: dict[str, JsonValue] = {
+            "window": "24h",
+            "generated_at": now.isoformat(timespec="seconds"),
+        }
+        try:
+            records = self._recent_canonical_records(
+                principal,
+                now=now,
+                window_seconds=quality_service.QUALITY_SUMMARY_WINDOW_SECONDS,
+            )
+        except Exception:
+            # run enumeration 자체가 불가능한 경우에만 unavailable — "0건"과 구분한다.
+            return ServiceResponse(
+                200,
+                {
+                    **base,
+                    "availability": "unavailable",
+                    "total_runs": 0,
+                    "evaluated_runs": 0,
+                    "pass_runs": 0,
+                    "warn_runs": 0,
+                    "fail_runs": 0,
+                },
+            )
+        entries = (
+            (record, datasets_service.read_manifest(self._output_root, record.run_id))
+            for record in records
+        )
+        counts = quality_service.aggregate_quality_window(
+            entries,
+            now=now,
+            window_seconds=quality_service.QUALITY_SUMMARY_WINDOW_SECONDS,
+        )
+        return ServiceResponse(200, {**base, "availability": "available", **counts})
+
+    def monitoring_summary(self) -> ServiceResponse:
+        """Builder API/Queue/Worker/Artifact Store 시스템 상태 요약 (#516).
+
+        시스템 aggregate만 담으며 개별 run의 dataset/owner/credential 정보는
+        포함하지 않는다 — ownership 필터링이 필요 없다. Provider status(#492)는
+        요청마다 실제 네트워크 프로브를 유발하므로 이번 PR에서는 포함하지 않는다.
+        """
+        api = monitoring_service.api_status(self._latency_recorder)
+        queue = monitoring_service.queue_status(self._async_builds)
+        workers = monitoring_service.worker_status(self._async_builds)
+        artifact_store = monitoring_service.artifact_store_status(
+            self._output_root, self._build_index
+        )
+        status = monitoring_service.aggregate_status(
+            api=api, queue=queue, workers=workers, artifact_store=artifact_store
+        )
+        generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return ServiceResponse(
+            200,
+            {
+                "generated_at": generated_at,
+                "status": status,
+                "api": {
+                    "availability": api.availability,
+                    "sample_count": api.sample_count,
+                    "p95_latency_ms": api.p95_latency_ms,
+                },
+                "queue": {
+                    "availability": queue.availability,
+                    "waiting": queue.waiting,
+                    "running": queue.running,
+                    "total": queue.total,
+                },
+                "workers": {
+                    "availability": workers.availability,
+                    "active": workers.active,
+                    "capacity": workers.capacity,
+                    "utilization": workers.utilization,
+                },
+                "artifact_store": {
+                    "availability": artifact_store.availability,
+                    "last_write_at": artifact_store.last_write_at,
+                },
+            },
+        )
+
+    def monitoring_builds(
+        self, *, window: str, bucket: str, principal: Principal | None = None
+    ) -> ServiceResponse:
+        """window/bucket별 build 통계와 recent runs를 반환한다 (#516).
+
+        ENFORCE_OWNERSHIP+oidc principal일 때는 본인이 접근 가능한 run만
+        집계·노출한다(#505) — 다른 principal의 run metadata가 새는 side
+        channel이 되지 않는다.
+        """
+        validated_window = monitoring_service.validate_window(window)
+        if validated_window is None:
+            return ServiceResponse(400, {"error": f"unsupported window: {window!r} (only '24h')"})
+        validated_bucket = monitoring_service.validate_bucket(bucket)
+        if validated_bucket is None:
+            return ServiceResponse(400, {"error": f"unsupported bucket: {bucket!r} (only 'hour')"})
+
+        stats = monitoring_service.build_statistics(
+            self._build_index,
+            window=validated_window,
+            bucket=validated_bucket,
+            principal=principal,
+            enforce_ownership=_enforce_ownership(),
+        )
+        buckets: list[JsonValue] = [
+            {
+                "bucket_start": b.bucket_start,
+                "bucket_end": b.bucket_end,
+                "total": b.total,
+                # wire 계약은 success/failed/cancelled다(#527) — 내부 BuildIndex
+                # status 값 "ok"는 그대로 두고 외부 필드 이름만 매핑한다.
+                "success": b.success,
+                "failed": b.failed,
+                "cancelled": b.cancelled,
+            }
+            for b in stats.buckets
+        ]
+        recent_runs: list[JsonValue] = [
+            {
+                "run_id": r.run_id,
+                "status": r.status,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+            }
+            for r in stats.recent_runs
+        ]
+        return ServiceResponse(
+            200,
+            {
+                "window": stats.window,
+                "bucket": stats.bucket,
+                "availability": stats.availability,
+                "excluded_count": stats.excluded_count,
+                "buckets": buckets,
+                "recent_runs": recent_runs,
+            },
+        )
+
     def list_run_stages(self, run_id: str) -> ServiceResponse:
         """run에 알려진 모든 source의 Bronze/Silver/Gold 상태를 반환한다 (#488).
 
@@ -1244,6 +2082,527 @@ class BuilderService:
 
         return ServiceResponse(200, body)
 
+    def _publish_context(
+        self, run_id: str
+    ) -> tuple[publish_service.RunStatus, dict[str, JsonValue] | None, BuildSpec | None]:
+        """publish readiness/POST가 공유하는 (status, manifest, spec) 조회.
+
+        route adapter가 이미 존재/ownership을 판정했다는 전제 아래(``/stages``,
+        ``/quality``와 동일한 패턴) 호출된다. manifest가 있으면 그것이 정본
+        (terminal run)이고, 없으면 async job registry(#482)에서 active/terminal
+        상태를 읽는다 — ``routes._guards.check_active_run_access``와 동일한
+        두 소스를 쓴다(#496 follow-up 패턴 재사용).
+        """
+        manifest = cast(
+            "dict[str, JsonValue] | None", datasets_service.read_manifest(self._output_root, run_id)
+        )
+        if manifest is not None:
+            status: publish_service.RunStatus = "failed" if manifest.get("errors") else "succeeded"
+            spec = datasets_service.read_snapshot_spec(self._output_root, run_id)
+            return status, manifest, spec
+        snapshot = self._async_builds.get(run_id)
+        if snapshot is not None:
+            return snapshot.status, None, None
+        # route adapter의 check_active_run_access가 이미 존재를 보장했으므로
+        # 이론상 도달하지 않는다 — fail-closed로 failed 취급한다.
+        return "failed", None, None
+
+    def publish_readiness(
+        self, run_id: str, target: str, destination: str | None = None
+    ) -> ServiceResponse:
+        """GET /builds/{run_id}/publish/readiness (#491).
+
+        side-effect-free다 — Publisher를 호출하거나 원격 dataset을 만들지
+        않는다. ready == blockers가 하나도 없음으로 deterministic하게 계산한다.
+        """
+        resolved_target, error = publish_service.resolve_target(target)
+        if resolved_target is None:
+            return ServiceResponse(
+                400,
+                {"error": error or "invalid target", "code": "unsupported_target"},
+            )
+
+        status, manifest, spec = self._publish_context(run_id)
+        result = publish_service.build_readiness(
+            run_id=run_id,
+            target=resolved_target,
+            destination=destination or "",
+            status=status,
+            manifest=cast("dict[str, object] | None", manifest),
+            spec=spec,
+            output_root=self._output_root,
+        )
+        return ServiceResponse(
+            200,
+            {
+                "run_id": run_id,
+                "target": result.target,
+                "ready": result.ready,
+                "blockers": cast(JsonValue, [b.to_body() for b in result.blockers]),
+                "warnings": cast(JsonValue, [w.to_body() for w in result.warnings]),
+            },
+        )
+
+    def publish(
+        self,
+        run_id: str,
+        body: Mapping[str, JsonValue] | None,
+        *,
+        principal: Principal,
+    ) -> ServiceResponse:
+        """POST /builds/{run_id}/publish (#491).
+
+        readiness와 완전히 같은 deterministic 검사를 다시 수행한다 — 호출자가
+        먼저 GET readiness를 불렀다고 신뢰하지 않는다(TOCTOU: readiness 통과
+        이후 상태가 바뀌어도 여기서 다시 막힌다). blocker가 하나라도 있으면
+        기존 Publisher를 절대 호출하지 않는다.
+        """
+        if not isinstance(body, Mapping):
+            return ServiceResponse(400, {"error": "request body must be a JSON object"})
+
+        unknown_fields = sorted(
+            str(key) for key in body if key not in {"target", "destination", "options"}
+        )
+        if unknown_fields:
+            return ServiceResponse(
+                400, {"error": f"unsupported request field(s): {unknown_fields!r}"}
+            )
+
+        resolved_target, error = publish_service.resolve_target(body.get("target"))
+        if resolved_target is None:
+            return ServiceResponse(
+                400,
+                {"error": error or "invalid target", "code": "unsupported_target"},
+            )
+
+        destination_error = publish_service.validate_destination(
+            resolved_target, body.get("destination")
+        )
+        if destination_error is not None:
+            return ServiceResponse(400, {"error": destination_error})
+        destination = cast(str, body["destination"])
+
+        options_error, options = publish_service.validate_options(
+            resolved_target, body.get("options")
+        )
+        if options_error is not None:
+            return ServiceResponse(400, {"error": options_error})
+
+        owner_key = principal.owner_id or principal.label
+        try:
+            existing = self._publish_receipts.lookup(
+                owner_key=owner_key,
+                run_id=run_id,
+                target=resolved_target,
+                destination=destination,
+                options=options,
+            )
+        except Exception as exc:
+            logger.error(
+                "publish receipt lookup failed: run_id=%s target=%s error_type=%s",
+                run_id,
+                resolved_target,
+                type(exc).__name__,
+            )
+            return ServiceResponse(
+                409,
+                {
+                    "error": "publish operation state is unavailable; retry is blocked",
+                    "code": "publish_state_unknown",
+                },
+            )
+        if existing is not None:
+            existing_response = _publish_receipt_response(*existing)
+            if existing_response is not None:
+                return existing_response
+
+        status, manifest, spec = self._publish_context(run_id)
+        readiness = publish_service.build_readiness(
+            run_id=run_id,
+            target=resolved_target,
+            destination=destination,
+            status=status,
+            manifest=cast("dict[str, object] | None", manifest),
+            spec=spec,
+            output_root=self._output_root,
+        )
+        if not readiness.ready or readiness.artifacts is None:
+            return ServiceResponse(
+                409,
+                {
+                    "error": f"run is not ready to publish to {resolved_target!r}",
+                    "blockers": cast(JsonValue, [b.to_body() for b in readiness.blockers]),
+                },
+            )
+
+        try:
+            claim_status, receipt = self._publish_receipts.claim(
+                owner_key=owner_key,
+                run_id=run_id,
+                target=resolved_target,
+                destination=destination,
+                options=options,
+            )
+        except Exception as exc:
+            logger.error(
+                "publish receipt claim failed: run_id=%s target=%s error_type=%s",
+                run_id,
+                resolved_target,
+                type(exc).__name__,
+            )
+            return ServiceResponse(
+                409,
+                {
+                    "error": "publish operation state is unavailable; retry is blocked",
+                    "code": "publish_state_unknown",
+                },
+            )
+
+        claimed_response = _publish_receipt_response(claim_status, receipt)
+        if claimed_response is not None:
+            return claimed_response
+
+        publisher = PUBLISHER_REGISTRY[resolved_target]
+        # local target은 destination을 publish-root 안의 절대 경로로 해석해
+        # 넘긴다(#550). readiness가 이미 통과했어도 여기서 다시 해석·검증한다
+        # (TOCTOU 재검증, #491과 동일 원칙).
+        effective_destination: str = destination
+        if resolved_target == "local":
+            resolved_local = publish_service.resolve_local_destination(destination)
+            if isinstance(resolved_local, publish_service.PublishIssue):
+                return ServiceResponse(
+                    409,
+                    {
+                        "error": f"run is not ready to publish to {resolved_target!r}",
+                        "blockers": [cast(JsonValue, resolved_local.to_body())],
+                    },
+                )
+            effective_destination = str(resolved_local[1])
+        publish_kwargs: dict[str, object] = {"destination": effective_destination, **options}
+        try:
+            result = publisher.publish(readiness.artifacts.paths, **publish_kwargs)  # type: ignore[arg-type]
+        except Exception as exc:
+            # Publisher가 던지는 예외(PublishError, credential/dependency
+            # RuntimeError, 그 외 검토하지 않은 예외 포함)는 어떤 것도 "안전한
+            # known exception"으로 취급하지 않는다 — 외부 SDK 예외 메시지에는
+            # 원격 응답 원문이나(#491 지침 1) 로컬 filesystem 절대 경로가 섞일
+            # 수 있다. client에는 항상 stable generic 메시지만 보낸다.
+            #
+            # 서버 log도 str(exc)/repr(exc)나 traceback(로그에 다시 raw
+            # message를 남기는 logger.exception())을 쓰지 않는다 — exception
+            # type과 이미 안전하다고 확인된 context만 남긴다.
+            logger.error(
+                "publish failed: run_id=%s target=%s error_type=%s",
+                run_id,
+                resolved_target,
+                type(exc).__name__,
+            )
+            try:
+                self._publish_receipts.mark_unknown(receipt.fingerprint)
+            except Exception as receipt_exc:
+                logger.error(
+                    "publish receipt unknown-state persist failed: "
+                    "run_id=%s target=%s error_type=%s",
+                    run_id,
+                    resolved_target,
+                    type(receipt_exc).__name__,
+                )
+            return ServiceResponse(
+                502,
+                {"error": "publish failed due to an unexpected error", "code": "publish_failed"},
+            )
+
+        response_body: dict[str, JsonValue] = {
+            "run_id": run_id,
+            "target": resolved_target,
+            "publisher": result.publisher,
+            "destination": destination,
+            "reference": result.reference,
+            "artifact_count": result.artifact_count,
+            "status": result.status,
+        }
+        try:
+            self._publish_receipts.mark_succeeded(
+                receipt.fingerprint, cast(dict[str, object], response_body)
+            )
+        except Exception as exc:
+            logger.error(
+                "publish receipt success persist failed: run_id=%s target=%s error_type=%s",
+                run_id,
+                resolved_target,
+                type(exc).__name__,
+            )
+            with suppress(Exception):
+                self._publish_receipts.mark_unknown(receipt.fingerprint)
+            return ServiceResponse(
+                502,
+                {"error": "publish failed due to an unexpected error", "code": "publish_failed"},
+            )
+        return ServiceResponse(200, response_body)
+
+    def get_publish_receipt(
+        self,
+        run_id: str,
+        target: str,
+        destination: str,
+        *,
+        principal: Principal,
+    ) -> ServiceResponse:
+        """GET /builds/{run_id}/publish/receipt (#551).
+
+        unknown receipt로 영구 차단된 운영자가 상태를 조회한다. 소유자 불일치는
+        404로 응답해 다른 owner의 receipt 존재 자체를 노출하지 않는다.
+        """
+        owner_key = principal.owner_id or principal.label
+        receipt = self._publish_receipts.get_by_key(
+            owner_key=owner_key, run_id=run_id, target=target, destination=destination
+        )
+        if receipt is None:
+            return ServiceResponse(
+                404, {"error": "publish receipt not found", "code": "receipt_not_found"}
+            )
+        body: dict[str, JsonValue] = {
+            "run_id": run_id,
+            "target": receipt.target,
+            "destination": receipt.destination,
+            "state": receipt.state,
+            "fingerprint": receipt.fingerprint,
+            "options": cast(JsonValue, receipt.options),
+            "reconcilable": receipt.state == "unknown",
+        }
+        if receipt.result is not None:
+            body["result"] = cast(JsonValue, receipt.result)
+        return ServiceResponse(200, body)
+
+    def publish_audit_log(self, run_id: str, *, principal: Principal) -> ServiceResponse:
+        """GET /builds/{run_id}/publish/audit (#563).
+
+        reconcile/reset 감사 이력을 소유자 단위로 반환한다 — receipt가 이미
+        reset으로 삭제된 경우도 포함한다. 항목은 최소 필드(fingerprint/action/
+        actor/recorded_at)만 담고 credential·경로 원문은 없다.
+        """
+        owner_key = principal.owner_id or principal.label
+        entries = self._publish_receipts.audit_entries(owner_key=owner_key, run_id=run_id)
+        return ServiceResponse(
+            200,
+            {
+                "run_id": run_id,
+                "entries": cast(JsonValue, entries),
+            },
+        )
+
+    def reconcile_publish(
+        self,
+        run_id: str,
+        body: Mapping[str, JsonValue] | None,
+        *,
+        principal: Principal,
+    ) -> ServiceResponse:
+        """POST /builds/{run_id}/publish/reconcile (#551).
+
+        unknown receipt를 원격 상태 확인으로 확정한다. 원격에 결과가 있으면
+        succeeded로 확정하고, 확실히 없으면 receipt를 reset해 재게시(새 claim)를
+        허용한다. 원격 확인 자체가 불가능하면 503 — 아무 것도 변경하지 않는다.
+        """
+        if not isinstance(body, Mapping):
+            return ServiceResponse(400, {"error": "request body must be a JSON object"})
+        unknown_fields = sorted(str(key) for key in body if key not in {"target", "destination"})
+        if unknown_fields:
+            return ServiceResponse(
+                400, {"error": f"unsupported request field(s): {unknown_fields!r}"}
+            )
+
+        resolved_target, target_error = publish_service.resolve_target(body.get("target"))
+        if resolved_target is None:
+            return ServiceResponse(
+                400, {"error": target_error or "invalid target", "code": "unsupported_target"}
+            )
+        destination_error = publish_service.validate_destination(
+            resolved_target, body.get("destination")
+        )
+        if destination_error is not None:
+            return ServiceResponse(400, {"error": destination_error})
+        destination = cast(str, body["destination"])
+
+        owner_key = principal.owner_id or principal.label
+        receipt = self._publish_receipts.get_by_key(
+            owner_key=owner_key, run_id=run_id, target=resolved_target, destination=destination
+        )
+        if receipt is None:
+            return ServiceResponse(
+                404, {"error": "publish receipt not found", "code": "receipt_not_found"}
+            )
+
+        if receipt.state == "succeeded":
+            # 이미 확정된 receipt는 멱등하게 그 상태를 돌려준다(원격 재조회 없음).
+            body_out: dict[str, JsonValue] = {
+                "run_id": run_id,
+                "state": "succeeded",
+                "reconciled": False,
+                "fingerprint": receipt.fingerprint,
+            }
+            if receipt.result is not None:
+                body_out["result"] = cast(JsonValue, receipt.result)
+            return ServiceResponse(200, body_out)
+
+        probe = self._probe_remote_publish_target(resolved_target, destination)
+        if probe is None:
+            return ServiceResponse(
+                503,
+                {
+                    "error": "remote state could not be determined; nothing was changed",
+                    "code": "reconcile_unavailable",
+                },
+            )
+        remote_exists = probe
+
+        if remote_exists:
+            result: dict[str, object] = {
+                "run_id": run_id,
+                "target": resolved_target,
+                "destination": destination,
+                "reconciled": True,
+                "status": "succeeded",
+            }
+            try:
+                self._publish_receipts.reconcile_succeeded(receipt.fingerprint, result)
+            except Exception as exc:
+                logger.error(
+                    "publish receipt reconcile persist failed: run_id=%s target=%s error_type=%s",
+                    run_id,
+                    resolved_target,
+                    type(exc).__name__,
+                )
+                return ServiceResponse(
+                    503,
+                    {
+                        "error": "reconcile outcome could not be persisted; nothing was changed",
+                        "code": "reconcile_unavailable",
+                    },
+                )
+            return ServiceResponse(
+                200,
+                {
+                    "run_id": run_id,
+                    "state": "succeeded",
+                    "reconciled": True,
+                    "fingerprint": receipt.fingerprint,
+                },
+            )
+
+        # 원격에 결과가 없다 — 게시가 실제로 일어나지 않았다고 확정할 수 없어도
+        # receipt를 reset해 운영자 판단으로 재게시를 허용한다(감사 로그에 남긴다).
+        reset_ok = self._publish_receipts.reset(
+            receipt.fingerprint, action="reconcile_absent_reset"
+        )
+        if not reset_ok:
+            return ServiceResponse(
+                503,
+                {
+                    "error": "reconcile reset could not be persisted; nothing was changed",
+                    "code": "reconcile_unavailable",
+                },
+            )
+        return ServiceResponse(
+            200,
+            {
+                "run_id": run_id,
+                "state": "reset",
+                "reconciled": True,
+                "retry_allowed": True,
+                "fingerprint": receipt.fingerprint,
+            },
+        )
+
+    def reset_publish_receipt(
+        self,
+        run_id: str,
+        target: str,
+        destination: str,
+        *,
+        principal: Principal,
+    ) -> ServiceResponse:
+        """DELETE /builds/{run_id}/publish/receipt (#551) — 명시적 reset.
+
+        어떤 상태든 receipt를 삭제해 새 claim을 허용한다. 원격 부작용은 전혀
+        발생하지 않는다(이미 게시된 결과를 되돌리지 않는다). 감사 로그에 남긴다.
+        """
+        owner_key = principal.owner_id or principal.label
+        receipt = self._publish_receipts.get_by_key(
+            owner_key=owner_key, run_id=run_id, target=target, destination=destination
+        )
+        if receipt is None:
+            return ServiceResponse(
+                404, {"error": "publish receipt not found", "code": "receipt_not_found"}
+            )
+        reset_ok = self._publish_receipts.reset(receipt.fingerprint, action="manual_reset")
+        if not reset_ok:
+            return ServiceResponse(
+                503,
+                {
+                    "error": "receipt reset could not be persisted; nothing was changed",
+                    "code": "reconcile_unavailable",
+                },
+            )
+        return ServiceResponse(
+            200,
+            {
+                "run_id": run_id,
+                "state": "reset",
+                "retry_allowed": True,
+                "fingerprint": receipt.fingerprint,
+            },
+        )
+
+    def _probe_remote_publish_target(self, target: str, destination: str) -> bool | None:
+        """원격에 publish 결과가 존재하는지 조사한다 (#551).
+
+        반환값: True(존재)/False(부재)/None(판단 불가 — credential·네트워크 문제).
+        조사 자체가 credential을 소비하거나 원격을 변경하지 않는 read-only다.
+        """
+        if target == "huggingface":
+            token = os.environ.get("HF_TOKEN", "").strip()
+            if not token:
+                return None
+            try:
+                from huggingface_hub import HfApi  # type: ignore[import-not-found]
+            except ImportError:
+                return None
+            try:
+                api = HfApi(token=token)
+                api.dataset_info(repo_id=destination, repo_type="dataset")
+            except Exception as exc:
+                # repo 부재(gated 401/404 계열)와 접근 실패를 구분한다 —
+                # huggingface_hub는 부재를 RepositoryNotFoundError로 알려준다.
+                name = type(exc).__name__
+                if name in ("RepositoryNotFoundError", "GatedRepoError"):
+                    return False
+                if getattr(exc, "status_code", None) in (401, 403):
+                    # 존재하지 않는 private repo도 401로 보이는 HF 특성상
+                    # 소유자라면 부재로 간주한다(asset이 내 credential로
+                    # 생성됐다면 접근 가능해야 하기 때문).
+                    return False
+                if getattr(exc, "status_code", None) == 404:
+                    return False
+                return None
+            return True
+        return None
+
+    def get_build_events(self, run_id: str, *, limit: int, tail: bool) -> ServiceResponse:
+        """run의 append-only structured event timeline을 조회한다 (#496).
+
+        호출 전에 run_id 검증·존재 확인·ownership 게이팅이 끝나 있어야 한다
+        (``/builds/{run_id}/stages``와 동일하게 dispatch route adapter가 먼저
+        처리한다). 반환은 항상 chronological ascending이다 — ``tail=True``도
+        최신 ``limit``개를 고르되 정렬 자체는 뒤집지 않는다(#496 ordering 정책).
+        """
+        events = self._event_store.list_for_run(run_id, limit=limit, tail=tail)
+        body: dict[str, JsonValue] = {
+            "run_id": run_id,
+            "events": cast(JsonValue, [events_service.event_to_json(e) for e in events]),
+        }
+        return ServiceResponse(200, body)
+
     def _load_validated(self, spec_yaml: str) -> BuildSpec | ServiceResponse:
         """spec_yaml을 파싱·검증하고, 실패 시 오류 ServiceResponse를 반환한다."""
         try:
@@ -1304,6 +2663,45 @@ def dispatch(
     *,
     api_key: str | None = None,
     bearer_token: str | None = None,
+    raw_body: bytes | None = None,
+) -> ServiceResponse | FileResponse:
+    """``_dispatch_impl``을 호출하고 처리 시간을 Monitoring latency 표본으로
+    기록한다 (#516).
+
+    타이밍은 라우팅+인증+비즈니스 로직 전체를 감싼다(HTTP 소켓 I/O는 제외 —
+    그건 http.py 계층). metric 기록 실패가 요청 실패로 전파되지 않도록
+    ``LatencyRecorder.record``가 이미 내부적으로 예외를 흡수한다.
+
+    ``raw_body``는 ``POST /uploads``(#498)에서만 쓰이는 binary body다 — 다른
+    모든 endpoint는 JSON ``body``만 사용하며 ``raw_body``는 None이다.
+    """
+    started = time.perf_counter()
+    try:
+        return _dispatch_impl(
+            service,
+            method,
+            path,
+            body,
+            query,
+            api_key=api_key,
+            bearer_token=bearer_token,
+            raw_body=raw_body,
+        )
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        service._latency_recorder.record(elapsed_ms)
+
+
+def _dispatch_impl(
+    service: BuilderService,
+    method: str,
+    path: str,
+    body: Mapping[str, JsonValue] | None,
+    query: str = "",
+    *,
+    api_key: str | None = None,
+    bearer_token: str | None = None,
+    raw_body: bytes | None = None,
 ) -> ServiceResponse | FileResponse:
     """(method, path)를 BuilderService 연산으로 라우팅한다.
 
@@ -1322,6 +2720,16 @@ def dispatch(
     principal = authenticate(api_key=api_key, bearer_token=bearer_token)
     if isinstance(principal, AuthError):
         return ServiceResponse(principal.status_code, {"error": principal.reason})
+
+    # /uploads(#498)는 binary body(raw_body)가 필요한 유일한 endpoint라 표준
+    # RouteAdapter(JSON body만 받음) 목록에 넣지 않고 여기서 직접 호출한다 —
+    # 과거의 거대한 dispatch monolith를 복원하는 것이 아니라, 이 한 endpoint의
+    # 전송 형태가 route adapter 계약과 다르기 때문이다.
+    uploads_response = uploads_route.handle(
+        service, method, path, principal, query=query, raw_body=raw_body
+    )
+    if uploads_response is not None:
+        return uploads_response
 
     for adapter in ROUTE_ADAPTERS:
         response = adapter(service, method, path, body, query, principal)

@@ -10,7 +10,7 @@ from ...spec import JsonValue
 from ...stages._path_safety import validate_path_segment
 from ..auth import Principal
 from ..responses import ServiceResponse
-from ._guards import check_ownership, check_run_exists
+from ._guards import check_active_run_access, check_ownership, check_run_exists
 from ._parsing import optional_run_id, spec_from_body
 from ._types import RouteResponse
 
@@ -33,10 +33,35 @@ def route(
         run_id = optional_run_id(body)
         if isinstance(run_id, ServiceResponse):
             return run_id
-        return service.submit_build(spec, run_id=run_id, created_by=principal.label)
+        return service.submit_build(
+            spec, run_id=run_id, created_by=principal.label, owner_id=principal.owner_id
+        )
+
+    # ADR 0008이 명시한 유일한 취소 endpoint (#481). alias를 추가하지 않는다.
+    if method == "POST" and path.startswith("/builds/") and path.endswith("/cancel"):
+        cancel_run_id = path[len("/builds/") : -len("/cancel")]
+        error = _validate_run_id(cancel_run_id)
+        if error is not None:
+            return error
+        # 취소는 state mutation이므로 조회보다 느슨해서는 안 된다. ``GET
+        # /builds/{run_id}``와 **정확히 같은** canonical 판정을 재사용한다 —
+        # manifest가 있으면 manifest 기준, active/terminal registry job이면
+        # snapshot의 stable owner_id 기준, 둘 다 없으면 404(fail-closed).
+        # 별도 policy를 만들지 않아 route 간 404/403 semantics가 어긋나지 않는다.
+        access_error = check_active_run_access(service, cancel_run_id, principal)
+        return access_error or service.cancel_build(cancel_run_id)
 
     if method == "GET" and path.startswith("/builds/") and "/" not in path[len("/builds/") :]:
-        return service.build_status(path[len("/builds/") :])
+        run_id = path[len("/builds/") :]
+        try:
+            validate_path_segment(run_id, field_name="run_id")
+        except ValueError as exc:
+            return ServiceResponse(400, {"error": str(exc)})
+        # 잡 상태 응답은 build 출력 전체(``response``)를 포함하므로 events와
+        # 동일하게 active async job(completed run 포함) ownership을 먼저 판정한다
+        # (#480 — cross-owner가 상태 polling으로 출력을 가져가는 것을 차단).
+        error = check_active_run_access(service, run_id, principal)
+        return error or service.build_status(run_id)
 
     if method == "GET" and path.startswith("/builds/") and path.endswith("/manifest"):
         rest = path[len("/builds/") :]

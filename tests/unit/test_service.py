@@ -11,9 +11,10 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from http.server import HTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
+import yaml
 
 import kpubdata_builder.service.app as app_module
 from kpubdata_builder.service import BuilderService, ServiceResponse, dispatch
@@ -21,6 +22,8 @@ from kpubdata_builder.service.auth import Principal
 from kpubdata_builder.service.http import _clear_cors_cache, make_handler
 from kpubdata_builder.service.ownership import _OWNERSHIP_ENV
 from kpubdata_builder.spec import JsonValue
+
+from ._openapi import response_schema, validate
 
 VALID_SPEC_YAML = (
     """
@@ -123,7 +126,7 @@ class _CloseTrackingClient(_FakeClient):
 
 def _service(tmp_path: Path) -> BuilderService:
     client = _FakeClient({"datago.air_quality": [{"id": "1", "v": 10}, {"id": "2", "v": 20}]})
-    return BuilderService(output_root=tmp_path, client_factory=lambda: client)
+    return BuilderService(output_root=tmp_path, client_factory=lambda **_kwargs: client)
 
 
 class TestVersion:
@@ -341,6 +344,143 @@ class TestBuild:
 
         assert isinstance(resp, ServiceResponse)
         assert resp.status_code == 404
+
+
+def _file_source_spec_yaml(upload_id: str) -> str:
+    return (
+        f"""
+dataset_id: dataset.uploaded
+title: Uploaded Trades
+description: file source build (#498)
+sources:
+  - kind: file
+    upload_id: {upload_id}
+    format: csv
+    encoding: utf-8
+exports:
+  - kind: jsonl
+    output_path: out/data.jsonl
+""".strip()
+        + "\n"
+    )
+
+
+class TestUploads:
+    """kind="file" source(#498) — POST /uploads가 owner_id로 격리한 업로드를
+    BuildSpec이 참조해 build/preview까지 이어지는 end-to-end 흐름을 검증한다."""
+
+    def test_create_upload_then_build_end_to_end(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        principal = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+
+        created = service.create_upload(
+            b"id,amount\n1,1000\n2,2500\n",
+            format="csv",
+            encoding="utf-8",
+            original_filename="trades.csv",
+            principal=principal,
+        )
+        assert created.status_code == 200
+        upload_id = created.body["upload_id"]
+        assert isinstance(upload_id, str)
+
+        result = service.build(
+            _file_source_spec_yaml(upload_id),
+            run_id="upload-run",
+            owner_id=principal.owner_id,
+            principal=principal,
+        )
+
+        assert result.status_code == 200
+        assert result.body["status"] == "ok"
+
+    def test_build_rejects_upload_owned_by_another_principal(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        owner = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+        other = Principal(kind="oidc", identifier="u2", owner_id="oidc:owner-2")
+
+        created = service.create_upload(
+            b"id\n1\n", format="csv", encoding="utf-8", original_filename=None, principal=owner
+        )
+        upload_id = created.body["upload_id"]
+        assert isinstance(upload_id, str)
+
+        result = service.build(
+            _file_source_spec_yaml(upload_id),
+            run_id="run-other-owner",
+            owner_id=other.owner_id,
+            principal=other,
+        )
+
+        assert result.status_code == 502
+        outcomes = cast(list[dict[str, JsonValue]], result.body["outcomes"])
+        assert outcomes[0]["status"] == "failed"
+        assert "not found" in cast(str, outcomes[0]["error"])
+
+    def test_get_and_delete_upload_round_trip(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        principal = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+        created = service.create_upload(
+            b"id\n1\n", format="csv", encoding="utf-8", original_filename=None, principal=principal
+        )
+        upload_id = created.body["upload_id"]
+        assert isinstance(upload_id, str)
+
+        fetched = service.get_upload(upload_id, principal=principal)
+        assert fetched.status_code == 200
+        assert fetched.body["upload_id"] == upload_id
+        assert "content" not in fetched.body
+
+        deleted = service.delete_upload(upload_id, principal=principal)
+        assert deleted.status_code == 200
+        assert deleted.body == {"upload_id": upload_id, "deleted": True}
+
+        missing = service.get_upload(upload_id, principal=principal)
+        assert missing.status_code == 404
+
+    def test_get_upload_hides_existence_from_other_principal(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        owner = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+        other = Principal(kind="oidc", identifier="u2", owner_id="oidc:owner-2")
+        created = service.create_upload(
+            b"id\n1\n", format="csv", encoding="utf-8", original_filename=None, principal=owner
+        )
+        upload_id = created.body["upload_id"]
+        assert isinstance(upload_id, str)
+
+        resp = service.get_upload(upload_id, principal=other)
+
+        assert resp.status_code == 404
+
+    def test_create_upload_rejects_corrupt_content(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        principal = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+
+        resp = service.create_upload(
+            b"not json",
+            format="json",
+            encoding="utf-8",
+            original_filename=None,
+            principal=principal,
+        )
+
+        assert resp.status_code == 400
+
+    def test_create_upload_rejects_unsupported_format(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        principal = Principal(kind="oidc", identifier="u1", owner_id="oidc:owner-1")
+
+        resp = service.create_upload(
+            b"data", format="xlsx", encoding="utf-8", original_filename=None, principal=principal
+        )
+
+        assert resp.status_code == 400
+
+    def test_preview_without_file_source_never_touches_upload_store(self, tmp_path: Path) -> None:
+        """file source가 없는 preview는 uploads.sqlite3를 만들지 않는다(지연 생성)."""
+        _service(tmp_path).preview(VALID_SPEC_YAML)
+
+        assert not (tmp_path / ".service" / "uploads.sqlite3").exists()
 
 
 class TestArtifacts:
@@ -1131,12 +1271,132 @@ class TestHttpAdapter:
         base_url, _, _ = http_server_with_auth
         with urllib.request.urlopen(f"{base_url}/healthz", timeout=2.0) as response:
             assert response.status == 200
+            request_id = response.headers["X-Request-ID"]
             body = cast(dict[str, object], json.loads(response.read()))
         assert body["status"] == "ok"
-        assert "request_id" in body
+        assert "request_id" not in body
+        assert request_id
         # 버전·서비스 메타 정보가 누출되지 않아야 한다.
         assert "api_version" not in body
         assert "service" not in body
+
+    @pytest.mark.parametrize("stage", ["bronze", "silver", "gold"])
+    def test_stage_detail_wire_response_conforms_to_openapi(
+        self,
+        http_server: tuple[str, HTTPServer, threading.Thread],
+        stage: str,
+    ) -> None:
+        base_url, _, _ = http_server
+        build_req = urllib.request.Request(
+            f"{base_url}/build",
+            data=json.dumps({"spec": VALID_SPEC_YAML, "run_id": "wire-stage-detail"}).encode(
+                "utf-8"
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(build_req, timeout=5.0) as response:
+            assert response.status == 200
+
+        url = f"{base_url}/builds/wire-stage-detail/stages/{stage}?source=datago.air_quality"
+        with urllib.request.urlopen(url, timeout=2.0) as response:
+            assert response.status == 200
+            status_code = response.status
+            request_id = response.headers["X-Request-ID"]
+            body = cast(dict[str, object], json.loads(response.read()))
+
+        assert "request_id" not in body
+        assert request_id
+        contract_path = Path(__file__).parents[2] / "contract" / "builder-api.yaml"
+        contract = cast(dict[str, Any], yaml.safe_load(contract_path.read_text(encoding="utf-8")))
+        schema = response_schema(contract, "/builds/{run_id}/stages/{stage}", "GET", status_code)
+        assert schema is not None
+        assert validate(body, schema, contract) == []
+
+
+class TestHttpUploads:
+    """POST /uploads(#498)의 실제 소켓 왕복 — binary body 전송·query 파싱·상한."""
+
+    def test_create_get_delete_upload_round_trip_over_http(
+        self, http_server: tuple[str, HTTPServer, threading.Thread]
+    ) -> None:
+        base_url, _, _ = http_server
+        req = urllib.request.Request(
+            f"{base_url}/uploads?format=csv&filename=trades.csv",
+            data=b"id,amount\n1,1000\n",
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            assert response.status == 200
+            created = cast(dict[str, object], json.loads(response.read()))
+        upload_id = created["upload_id"]
+        assert isinstance(upload_id, str) and upload_id.startswith("upl_")
+        assert created["original_filename"] == "trades.csv"
+
+        with urllib.request.urlopen(f"{base_url}/uploads/{upload_id}", timeout=2.0) as response:
+            assert response.status == 200
+            fetched = cast(dict[str, object], json.loads(response.read()))
+        assert fetched["upload_id"] == upload_id
+        assert "content" not in fetched
+
+        delete_req = urllib.request.Request(f"{base_url}/uploads/{upload_id}", method="DELETE")
+        with urllib.request.urlopen(delete_req, timeout=2.0) as response:
+            assert response.status == 200
+            deleted = cast(dict[str, object], json.loads(response.read()))
+        assert deleted["upload_id"] == upload_id
+        assert deleted["deleted"] is True
+
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"{base_url}/uploads/{upload_id}", timeout=2.0)
+        assert exc_info.value.code == 404
+
+    def test_create_upload_over_configured_limit_returns_413(
+        self,
+        http_server: tuple[str, HTTPServer, threading.Thread],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("KPUBDATA_BUILDER_MAX_UPLOAD_BYTES", "10")
+        base_url, _, _ = http_server
+        req = urllib.request.Request(
+            f"{base_url}/uploads?format=csv",
+            data=b"a,b\n" * 10,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=2.0)
+        assert exc_info.value.code == 413
+
+    def test_create_upload_missing_format_returns_400(
+        self, http_server: tuple[str, HTTPServer, threading.Thread]
+    ) -> None:
+        base_url, _, _ = http_server
+        req = urllib.request.Request(
+            f"{base_url}/uploads",
+            data=b"id,amount\n1,1000\n",
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=2.0)
+        assert exc_info.value.code == 400
+
+    def test_create_upload_body_is_not_parsed_as_json(
+        self, http_server: tuple[str, HTTPServer, threading.Thread]
+    ) -> None:
+        # POST /uploads의 body는 CSV/바이너리도 그대로 허용된다 — 다른 endpoint와
+        # 달리 JSON 파싱을 시도하지 않는다(#498). 이 body는 유효한 JSON이 아니지만
+        # (raw text) 유효한 CSV이므로 format=csv로 성공해야 한다.
+        base_url, _, _ = http_server
+        req = urllib.request.Request(
+            f"{base_url}/uploads?format=csv",
+            data=b"a,b\n1,2\n",
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            assert response.status == 200
 
 
 class TestHttpRobustness:
@@ -1438,6 +1698,73 @@ class TestArtifactFileServing:
         assert resp.status_code == 200
         assert resp.filename == "manifest.json"
 
+    def test_serves_nested_relative_path(self, tmp_path: Path) -> None:
+        """GET /artifacts/{run_id}가 돌려주는 run 디렉터리 기준 상대 경로(슬래시 포함)를
+        serve_artifact_file도 그대로 받아야 한다 (#323 후속). 이전에는 file_path 전체를
+        한 세그먼트로 검증해 'silver/air/table.parquet' 같은 값이 전부 400이었다."""
+        from kpubdata_builder.service import FileResponse
+
+        service = _service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run1"})
+
+        nested = tmp_path / "run1" / "silver" / "air" / "table.parquet"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_bytes(b"PAR1nested")
+
+        listed = service.artifacts("run1")
+        assert isinstance(listed, ServiceResponse)
+        # wire 목록은 항상 POSIX "/" 기반이어야 한다 (OS 구분자·output_root prefix 없음).
+        for wire_path in listed.body["files"]:
+            assert "\\" not in wire_path
+            assert not wire_path.startswith("/")
+            assert str(tmp_path) not in wire_path
+        assert "silver/air/table.parquet" in set(listed.body["files"])
+
+        resp = service.serve_artifact_file("run1", "silver/air/table.parquet")
+        assert isinstance(resp, FileResponse)
+        assert resp.status_code == 200
+        assert resp.filename == "table.parquet"
+        assert resp.file_path.read_bytes() == b"PAR1nested"
+
+        route_resp = dispatch(service, "GET", "/artifacts/run1/silver/air/table.parquet", None)
+        assert isinstance(route_resp, FileResponse)
+        assert route_resp.status_code == 200
+
+    def test_blocks_backslash_in_nested_path(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run1"})
+
+        resp = service.serve_artifact_file("run1", "silver\\..\\..\\secret.txt")
+        assert isinstance(resp, ServiceResponse)
+        assert resp.status_code == 400
+
+    def test_blocks_percent_encoded_traversal(self, tmp_path: Path) -> None:
+        """percent-encode된 트래버설/구분자는 decode 후 다시 검증되어 차단된다."""
+        service = _service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run1"})
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run2"})
+
+        for encoded in (
+            "%2e%2e/run2/manifest.json",  # ../run2/manifest.json
+            "silver%2f..%2f..%2fmanifest.json",  # silver/../../manifest.json
+            "silver%5c..%5c..%5cmanifest.json",  # silver\..\..\manifest.json
+            "%252e%252e/run2/manifest.json",  # double-encoded ..
+            "..%2f..%2fetc%2fpasswd",
+        ):
+            resp = service.serve_artifact_file("run1", encoded)
+            assert isinstance(resp, ServiceResponse), encoded
+            assert resp.status_code == 400, encoded
+
+    def test_blocks_cross_run_and_double_slash(self, tmp_path: Path) -> None:
+        service = _service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run1"})
+        dispatch(service, "POST", "/build", {"spec": VALID_SPEC_YAML, "run_id": "run2"})
+
+        # 다른 run 파일: '..'로만 접근 가능하므로 차단된다.
+        assert service.serve_artifact_file("run1", "../run2/manifest.json").status_code == 400
+        # double slash -> 빈 성분
+        assert service.serve_artifact_file("run1", "silver//table.parquet").status_code == 400
+
     def test_mime_type_detection(self, tmp_path: Path) -> None:
         from kpubdata_builder.service.http import _get_mime_type
 
@@ -1673,17 +2000,43 @@ class TestStableOwnerIdOwnership:
 
 
 class _FakeCatalogRef:
-    """DatasetRef 흉내 — catalog() 가 접근하는 속성만 노출."""
+    """DatasetRef 흉내 — catalog() 가 접근하는 속성만 노출.
+
+    기본값은 실제 DatasetRef의 기본값과 같다(metadata 없는 dataset — #490
+    null/empty 직렬화 규칙 검증에 그대로 쓴다).
+    """
 
     def __init__(
-        self, provider: str, dataset_key: str, name: str, *, service_key: bool = False
+        self,
+        provider: str,
+        dataset_key: str,
+        name: str,
+        *,
+        service_key: bool = False,
+        description: str | None = None,
+        tags: tuple[str, ...] = (),
+        source_url: str | None = None,
+        representation: object = None,
+        operations: frozenset[object] = frozenset(),
+        query_support: object = None,
+        raw_metadata_extra: dict[str, object] | None = None,
     ) -> None:
+        from kpubdata.core.models import Representation
+
         self.provider = provider
         self.dataset_key = dataset_key
         self.name = name
+        self.description = description
+        self.tags = tags
+        self.source_url = source_url
+        self.representation = representation or Representation.API_JSON
+        self.operations = operations
+        self.query_support = query_support
         self.raw_metadata: dict[str, object] = (
             {"service_key_param": "serviceKey"} if service_key else {}
         )
+        if raw_metadata_extra:
+            self.raw_metadata.update(raw_metadata_extra)
 
 
 class TestCatalog:
@@ -1698,6 +2051,67 @@ class TestCatalog:
     ) -> BuilderService:
         client = _FakeClient({}, catalog_items=refs, auth_provider_names=auth_provider_names)
         return BuilderService(output_root=tmp_path, client_factory=lambda: client)
+
+    def _service_with_lazy_provider_catalog(
+        self,
+        tmp_path: Path,
+        *,
+        missing_provider: str | None = None,
+        missing_module: str = "pandas",
+    ) -> BuilderService:
+        refs = {
+            "datago": [_FakeCatalogRef("datago", "air_quality", "대기오염")],
+            "krx": [_FakeCatalogRef("krx", "stock", "주식")],
+        }
+
+        class Registry:
+            def __iter__(self) -> Iterable[str]:
+                return iter(("datago", "krx"))
+
+            def get(self, name: str) -> object:
+                if name == missing_provider:
+                    raise ModuleNotFoundError(
+                        f"No module named '{missing_module}'", name=missing_module
+                    )
+                return type("Adapter", (), {"requires_api_key": name == "datago"})()
+
+        class Catalog:
+            @staticmethod
+            def list(*, provider: str) -> list[object]:
+                return refs[provider]
+
+        class Client:
+            _registry = Registry()
+            datasets = Catalog()
+
+            def close(self) -> None:
+                return None
+
+        return BuilderService(output_root=tmp_path, client_factory=Client)
+
+    def test_catalog_skips_only_krx_when_optional_pandas_is_missing(self, tmp_path: Path) -> None:
+        response = self._service_with_lazy_provider_catalog(
+            tmp_path, missing_provider="krx"
+        ).catalog()
+
+        assert response.status_code == 200
+        providers = cast(list[dict[str, object]], response.body["providers"])
+        assert [provider["name"] for provider in providers] == ["datago"]
+
+    def test_catalog_does_not_hide_other_provider_missing_module(self, tmp_path: Path) -> None:
+        response = self._service_with_lazy_provider_catalog(
+            tmp_path, missing_provider="datago", missing_module="internal_datago"
+        ).catalog()
+
+        assert response.status_code == 502
+        assert "internal_datago" in cast(str, response.body["error"])
+
+    def test_catalog_keeps_krx_when_optional_dependency_is_available(self, tmp_path: Path) -> None:
+        response = self._service_with_lazy_provider_catalog(tmp_path).catalog()
+
+        assert response.status_code == 200
+        providers = cast(list[dict[str, object]], response.body["providers"])
+        assert [provider["name"] for provider in providers] == ["datago", "krx"]
 
     def test_catalog_groups_datasets_by_provider(self, tmp_path: Path) -> None:
         refs = [
@@ -1743,6 +2157,189 @@ class TestCatalog:
         resp = self._service_with_catalog(tmp_path, []).catalog()
         assert resp.status_code == 200
         assert resp.body["providers"] == []
+
+    def test_catalog_serializes_discovery_metadata(self, tmp_path: Path) -> None:
+        """DatasetRef의 탐색용 metadata가 allowlist로 직렬화된다 (#490)."""
+        from kpubdata.core.capability import PaginationMode, QuerySupport
+        from kpubdata.core.models import Operation, Representation
+
+        ref = _FakeCatalogRef(
+            "datago",
+            "air_quality",
+            "대기오염",
+            description="측정소별 대기오염 물질 농도",
+            tags=("environment", "air"),
+            source_url="https://www.data.go.kr/data/15073861/openapi",
+            representation=Representation.API_JSON,
+            operations=frozenset({Operation.GET, Operation.LIST}),
+            query_support=QuerySupport(
+                pagination=PaginationMode.OFFSET,
+                filterable_fields=frozenset({"station_name"}),
+                sortable_fields=frozenset(),
+                time_range=True,
+                max_page_size=1000,
+            ),
+        )
+        resp = self._service_with_catalog(tmp_path, [ref]).catalog()
+
+        assert resp.status_code == 200
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert dataset["description"] == "측정소별 대기오염 물질 농도"
+        assert dataset["tags"] == ["air", "environment"]
+        assert dataset["source_url"] == "https://www.data.go.kr/data/15073861/openapi"
+        assert dataset["representation"] == "api_json"
+        assert dataset["operations"] == ["get", "list"]
+        query_support = cast(dict[str, object], dataset["query_support"])
+        assert query_support["pagination"] == "offset"
+        assert query_support["filterable_fields"] == ["station_name"]
+        assert query_support["sortable_fields"] == []
+        assert query_support["time_range"] is True
+        assert query_support["max_page_size"] == 1000
+
+    def test_catalog_metadata_less_dataset_serializes_null_and_empty(self, tmp_path: Path) -> None:
+        """metadata 없는 dataset은 null/empty로 직렬화되고 응답이 깨지지 않는다 (#490)."""
+        resp = self._service_with_catalog(
+            tmp_path, [_FakeCatalogRef("datago", "air_quality", "대기오염")]
+        ).catalog()
+
+        assert resp.status_code == 200
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert dataset["description"] is None
+        assert dataset["tags"] == []
+        assert dataset["source_url"] is None
+        assert dataset["representation"] == "api_json"
+        assert dataset["operations"] == []
+        assert dataset["query_support"] is None
+        assert dataset["requires_service_key"] is False
+        assert dataset["request_parameters"] == []
+        assert dataset["application"] is None
+
+    def test_catalog_serializes_application_when_declared(self, tmp_path: Path) -> None:
+        """raw_metadata.application을 그대로 전달한다 (활용신청 안내, secret 없음)."""
+        ref = _FakeCatalogRef(
+            "datago",
+            "air_quality",
+            "대기오염",
+            service_key=True,
+            raw_metadata_extra={
+                "application": {
+                    "required": True,
+                    "url": "https://www.data.go.kr/data/15073861/openapi.do",
+                },
+            },
+        )
+        resp = self._service_with_catalog(tmp_path, [ref]).catalog()
+
+        assert resp.status_code == 200
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert dataset["application"] == {
+            "required": True,
+            "url": "https://www.data.go.kr/data/15073861/openapi.do",
+        }
+
+    def test_catalog_rejects_non_http_application_url(self, tmp_path: Path) -> None:
+        """application.url이 http(s)가 아니면 통째로 노출하지 않는다(임의 스킴 차단)."""
+        ref = _FakeCatalogRef(
+            "datago",
+            "air_quality",
+            "대기오염",
+            raw_metadata_extra={
+                "application": {"required": True, "url": "javascript:alert(1)"},
+            },
+        )
+        resp = self._service_with_catalog(tmp_path, [ref]).catalog()
+
+        assert resp.status_code == 200
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert dataset["application"] is None
+
+    def test_catalog_serializes_request_parameters_without_secrets(self, tmp_path: Path) -> None:
+        """raw_metadata.request_parameters를 secret-free allowlist로 직렬화한다."""
+        ref = _FakeCatalogRef(
+            "datago",
+            "air_quality",
+            "대기오염",
+            service_key=True,
+            raw_metadata_extra={
+                "request_parameters": [
+                    {
+                        "name": "sidoName",
+                        "required": True,
+                        "description": "조회할 시·도",
+                        "example": "서울",
+                        "internal_hint": "leak me",
+                    },
+                    # service_key_param / secret-like 이름은 제외된다.
+                    {"name": "serviceKey", "required": True},
+                    {"name": "apiKey", "required": True},
+                    # name 없는 항목은 버린다.
+                    {"required": True},
+                    "not-a-dict",
+                ],
+            },
+        )
+        resp = self._service_with_catalog(tmp_path, [ref]).catalog()
+
+        assert resp.status_code == 200
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert dataset["request_parameters"] == [
+            {
+                "name": "sidoName",
+                "required": True,
+                "description": "조회할 시·도",
+                "example": "서울",
+            }
+        ]
+        assert "internal_hint" not in json.dumps(resp.body, ensure_ascii=False)
+        assert "leak me" not in json.dumps(resp.body, ensure_ascii=False)
+
+    def test_catalog_never_exposes_raw_metadata_or_secrets(self, tmp_path: Path) -> None:
+        """raw_metadata와 secret-like 값은 응답에 절대 노출되지 않는다 (#490)."""
+        ref = _FakeCatalogRef(
+            "datago",
+            "air_quality",
+            "대기오염",
+            service_key=True,
+            raw_metadata_extra={
+                "internal_note": "provider private",
+                "api_key": "sk-secret-value",
+                "service_key": "raw-secret",
+                "endpoint_template": "/openapi/{serviceKey}",
+            },
+        )
+        resp = self._service_with_catalog(tmp_path, [ref]).catalog()
+
+        assert resp.status_code == 200
+        serialized = json.dumps(resp.body, ensure_ascii=False)
+        assert "internal_note" not in serialized
+        assert "provider private" not in serialized
+        assert "sk-secret-value" not in serialized
+        assert "raw-secret" not in serialized
+        assert "endpoint_template" not in serialized
+        # allowlist 필드만 존재한다.
+        providers = cast(list[dict[str, object]], resp.body["providers"])
+        dataset = cast(dict[str, object], providers[0]["datasets"][0])
+        assert set(dataset) == {
+            "name",
+            "title",
+            "description",
+            "tags",
+            "source_url",
+            "representation",
+            "operations",
+            "query_support",
+            "requires_service_key",
+            "request_parameters",
+            "application",
+        }
+        # service_key_param 존재 여부는 requires_service_key 불리언으로만 전달된다.
+        assert dataset["requires_service_key"] is True
+        assert "service_key_param" not in serialized
 
     def test_catalog_closes_request_client(self, tmp_path: Path) -> None:
         client = _CloseTrackingClient(

@@ -1,6 +1,6 @@
-"""ArtifactStore Protocol (ADR 0010/0013).
+"""ArtifactStore Protocol (ADR 0010/0016).
 
-산출물 워크스페이스 접근과 manifest 문서 소유를 추상화한다. 승인된 설계(ADR 0013):
+산출물 워크스페이스 접근과 manifest 문서 소유를 추상화한다. 승인된 설계(ADR 0016):
 
 - **산출물 바이트**(parquet/CSV/HF 레이아웃 등)는 두 백엔드 모두 로컬 파일시스템
   (OCI 블록 볼륨)에 둔다 — ``query/engine.py`` 가 별도 프로세스에서 ``pl.scan_parquet``

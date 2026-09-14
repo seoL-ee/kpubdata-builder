@@ -1,6 +1,6 @@
 # 배포 가이드
 
-Builder HTTP 서비스를 로컬 개발 이상으로 운영하기 위한 배포·인증 스토리. 본 문서는 [ADR 0006](./adrs/0006-service-auth-and-deployment.md)(인증·배포)과 ADR 0009(사용자 인증, PR #398)의 운영 가이드를 통합한다.
+Builder HTTP 서비스를 로컬 개발 이상으로 운영하기 위한 배포·인증 스토리. 본 문서는 [ADR 0006](./adrs/0006-service-auth-and-deployment.md)(인증·배포), ADR 0009(사용자 인증, PR #398 — [ADR 0015](./adrs/0015-email-password-oidc-idp-keycloak.md)로 대체됨)의 운영 가이드를 통합한다.
 
 > **상태**: ADR 0009는 제안됨(Proposed). 인증(Bearer) 구현은 B3(#385)/B4(#386) 진행 중이며, 본 문서의 Bearer 관련 절은 구현 완료 후 적용된다. 컨테이너 배포(fail-closed, HEALTHCHECK)는 이미 구현되었다.
 
@@ -22,6 +22,8 @@ Builder HTTP 서비스를 로컬 개발 이상으로 운영하기 위한 배포�
 두 경로 모두 `Principal`(`service`/`oidc`/`dev`)로 정규화된다 (B2/#384).
 
 ## 3. Google OAuth client 설정
+
+> **전환 안내(ADR 0015)**: 사람 사용자 인증 IdP는 self-hosted Keycloak(email/password-capable OIDC)로 확정되었고 본 절의 Google 직접 audience 구성은 대체되었다. IdP 전환 절차·설정 분리는 [ADR 0015](./adrs/0015-email-password-oidc-idp-keycloak.md)를 따른다. 아래는 ADR 0009 시대의 기록으로 남긴다.
 
 1. Google Cloud Console → APIs & Services → Credentials → **OAuth client ID**.
 2. **Web application** 타입으로 생성.
@@ -59,7 +61,7 @@ Builder HTTP 서비스를 로컬 개발 이상으로 운영하기 위한 배포�
 
 멀티 replica는 ADR 0010(`ArtifactStore` 추상화 + 백엔드 분리) 이행 후 가능하다.
 
-### 6.1 CUBRID 상태 백엔드 (ADR 0013)
+### 6.1 CUBRID 상태 백엔드 (ADR 0016)
 
 기본 백엔드는 sqlite/local(무외부의존)이다. 조직 요구로 CUBRID 를 쓰려면
 (OCI Compute VM + Docker 단일 인스턴스 전제):
@@ -79,9 +81,9 @@ docker run --rm -p 8000:8000 \
 
 - **BuildIndex·Credential·manifest 문서**가 CUBRID 에 저장된다. **산출물 바이트는 여전히
   `/data`(블록 볼륨)** 에 둔다 — 쿼리 엔진이 실제 parquet 경로를 요구하고 대용량 BLOB 을
-  RDBMS 에 넣지 않기 위함(ADR 0013). 따라서 `/data` 볼륨 마운트는 CUBRID 백엔드에서도 필수다.
+  RDBMS 에 넣지 않기 위함(ADR 0016). 따라서 `/data` 볼륨 마운트는 CUBRID 백엔드에서도 필수다.
 - serve 시작 시 `KPUBDATA_BUILDER_CUBRID_URL` 미설정·드라이버 미설치면 fail-closed 로 기동을 거부한다.
-- 마이그레이션(FS→CUBRID)·정본 이전·리스크는 [ADR 0013](./adrs/0013-cubrid-state-backend.md) 참조.
+- 마이그레이션(FS→CUBRID)·정본 이전·리스크는 [ADR 0016](./adrs/0016-cubrid-state-backend.md) 참조.
 - CUBRID 는 OCI 관리형 서비스가 없으므로 같은 VM 에 컨테이너로 함께 띄운다(예: docker-compose,
   `infra/oci/` 참조).
 
@@ -167,6 +169,33 @@ startup 비용 대신 강한 취소·수명 격리를 선택한다. 비동기 bu
 분리하면 HTTP process 장애와 GIL/메모리 경쟁을 줄이지만 외부 queue, 상태 영속성, credential
 전달 신뢰경계와 운영 복잡도가 증가한다. 이 tradeoff는 ADR 0008 승인 과정에서 결정한다.
 
+## 11. 컨테이너 이미지 취약점 스캔 게이트 (Trivy)
+
+`docker.yml` 워크플로가 serve 이미지를 빌드해 Trivy로 스캔한다 (#376 도입, #552 정책 문서화).
+
+**게이트 정책** (변경 시 이 문서와 함께 갱신할 것):
+
+| 항목 | 값 | 근거 |
+| :--- | :--- | :--- |
+| 대상 severity | `CRITICAL,HIGH` | MEDIUM 이하는 배포를 막는 신호로 쓰지 않는다 |
+| 실패 동작 | `exit-code: 1` (job 실패 → GHCR publish 차단) | 취약점이 있는 이미지가 배포되지 않게 fail-closed |
+| `ignore-unfixed` | `true` | 업스트림 패치가 없는 finding은 PR 신호를 오염시킨다 |
+| 예외 처리 | 원칙적으로 없음. 불가피한 경우 `.trivyignore`에 CVE·만료일·근거 주석 명시 | 무기한 예외 금지 |
+
+**base image 취약점 대응 이력**:
+
+- CVE-2026-53615 (Debian `util-linux` 계열 HIGH 9건, 2026-08): 베이스 이미지의
+  `apt-get upgrade` 레이어를 Dockerfile에 추가해 해소 (PR #547). 이후 기능 PR들이
+  이미지 스캔 실패로 오염되지 않도록, **베이스 패치는 기능 PR과 별도 커밋**으로
+  Dockerfile에 반영하는 것이 원칙이다.
+- Trivy 자체·action 버전 bump는 dependabot이 따른다 (워크플로 수정이라 병합에
+  `workflow` 스코프 토큰 또는 웹 UI가 필요할 수 있다).
+
+**CI 신호 분리**: docker 워크플로는 `Dockerfile`/`docker-entrypoint.sh`/`.dockerignore`/
+`pyproject.toml`/`uv.lock`/`src/**`/워크플로 자체 변경 시에만 실행된다(이미지에
+포함되는 파일이 바뀌어야 재스캔이 의미 있음). 문서·테스트 전용 변경은 스캔을
+트리거하지 않으므로 기능 PR과 독립적인 신호를 유지한다.
+
 ## 관련
 
 - [ADR 0006](./adrs/0006-service-auth-and-deployment.md) — 인증·배포(fail-closed, Docker)
@@ -174,3 +203,15 @@ startup 비용 대신 강한 취소·수명 격리를 선택한다. 비동기 bu
 - ADR 0010(PR #399) — 상태 백엔드 분리(제안됨)
 - [ADR 0008](./adrs/0008-async-build-job-model.md) — 비동기 build job 모델(제안됨)
 - [API_CONTRACT.md](./API_CONTRACT.md) — `/healthz`, 401/403/503 응답
+# Keycloak 공개 사용자 설정
+
+클라우드 배포에서 Studio는 public SPA로 Keycloak의 Authorization Code + PKCE(S256)를 사용한다.
+Builder는 `OIDC_ISSUER`와 `OIDC_AUDIENCE`가 모두 설정된 정상 OIDC 토큰만 수락하며,
+issuer·audience·JWKS 서명·만료 검증은 항상 fail-closed로 유지한다. `OIDC_ALLOWED_HD`,
+`OIDC_ALLOWED_SUBJECTS`, `OIDC_ALLOWED_EMAILS`는 필수가 아니라 제한 배포에서만 쓰는
+선택적 2차 인가 규칙이다. 하나라도 설정하면 일치하지 않는 principal은 403이다.
+
+Keycloak Admin Console에서 realm의 User registration과 Verify email을 켜고 적절한
+password policy를 설정한다. Google Identity Broker를 사용하려면 broker의 Store Tokens는
+꺼 둔다. Studio가 Google token을 Builder에 직접 전달하지 않으며, signup/password UI는
+Keycloak hosted UI가 담당한다. 스케줄러 등 service principal은 기존 `X-API-Key`를 계속 사용한다.

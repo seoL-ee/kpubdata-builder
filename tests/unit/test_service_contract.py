@@ -50,6 +50,9 @@ _DISPATCH_ROUTES: dict[tuple[str, str], str] = {
     ("/preview", "POST"): "previewBuild",
     ("/build", "POST"): "createBuild",
     ("/builds", "GET"): "listBuilds",
+    ("/builds", "POST"): "submitBuild",
+    ("/builds/{run_id}", "GET"): "getBuildJob",
+    ("/builds/{run_id}/cancel", "POST"): "cancelBuildJob",
     ("/builds/{run_id}/manifest", "GET"): "getBuildManifest",
     ("/builds/{run_id}/spec", "GET"): "getBuildSpecSnapshot",
     ("/artifacts/{run_id}", "GET"): "listBuildArtifacts",
@@ -60,6 +63,15 @@ _DISPATCH_ROUTES: dict[tuple[str, str], str] = {
     ("/builds/{run_id}/stages", "GET"): "listBuildStages",
     ("/builds/{run_id}/stages/{stage}", "GET"): "getBuildStageDetail",
     ("/builds/{run_id}/quality", "GET"): "getBuildQuality",
+    ("/quality/summary", "GET"): "getQualitySummary",
+    ("/builds/{run_id}/events", "GET"): "getBuildEvents",
+    ("/builds/{run_id}/publish/readiness", "GET"): "getPublishReadiness",
+    ("/builds/{run_id}/publish", "POST"): "publishBuild",
+    ("/monitoring/summary", "GET"): "getMonitoringSummary",
+    ("/monitoring/builds", "GET"): "getMonitoringBuilds",
+    ("/uploads", "POST"): "createUpload",
+    ("/uploads/{upload_id}", "GET"): "getUpload",
+    ("/uploads/{upload_id}", "DELETE"): "deleteUpload",
 }
 
 # (path, method) 형태의 계약 필수 오퍼레이션. BuilderService.dispatch가 실제로
@@ -78,6 +90,8 @@ _REQUIRED_OPERATIONS = [
     ("/validate", "post"),
     ("/preview", "post"),
     ("/build", "post"),
+    ("/builds", "post"),
+    ("/builds/{run_id}", "get"),
     ("/builds/{run_id}/manifest", "get"),
     ("/builds/{run_id}/spec", "get"),
     ("/artifacts/{run_id}", "get"),
@@ -89,6 +103,15 @@ _REQUIRED_OPERATIONS = [
     ("/builds/{run_id}/stages", "get"),
     ("/builds/{run_id}/stages/{stage}", "get"),
     ("/builds/{run_id}/quality", "get"),
+    ("/quality/summary", "get"),
+    ("/builds/{run_id}/events", "get"),
+    ("/builds/{run_id}/publish/readiness", "get"),
+    ("/builds/{run_id}/publish", "post"),
+    ("/monitoring/summary", "get"),
+    ("/monitoring/builds", "get"),
+    ("/uploads", "post"),
+    ("/uploads/{upload_id}", "get"),
+    ("/uploads/{upload_id}", "delete"),
 ]
 
 
@@ -153,6 +176,15 @@ def test_query_response_requires_documented_nonnegative_timings() -> None:
         assert schema["properties"][field]["type"] == "integer"
         assert schema["properties"][field]["minimum"] == 0
         assert schema["properties"][field]["description"]
+
+
+def test_main_contract_version_is_stable_semver() -> None:
+    """main 계약은 prerelease/build suffix 없는 식별 가능한 stable SemVer다 (#521)."""
+    from kpubdata_builder.service import API_CONTRACT_VERSION
+
+    parts = API_CONTRACT_VERSION.split(".")
+    assert len(parts) == 3
+    assert all(part.isdigit() for part in parts)
 
 
 def test_build_manifest_does_not_publish_internal_owner_id() -> None:
@@ -354,6 +386,9 @@ _IMPLEMENTED_OPERATIONS = {
     "validateSpec",
     "previewBuild",
     "createBuild",
+    "submitBuild",
+    "getBuildJob",
+    "cancelBuildJob",
     "getBuildManifest",
     "getBuildSpecSnapshot",
     "listBuildArtifacts",
@@ -365,6 +400,15 @@ _IMPLEMENTED_OPERATIONS = {
     "listBuildStages",
     "getBuildStageDetail",
     "getBuildQuality",
+    "getQualitySummary",
+    "getBuildEvents",
+    "getPublishReadiness",
+    "publishBuild",
+    "getMonitoringSummary",
+    "getMonitoringBuilds",
+    "createUpload",
+    "getUpload",
+    "deleteUpload",
 }
 
 
@@ -571,6 +615,9 @@ _OPERATION_STATUS_CODES: dict[str, set[int]] = {
     "validateSpec": {200, 400},
     "previewBuild": {200, 400, 502},
     "createBuild": {200, 400, 502},
+    "submitBuild": {200, 202, 400, 409, 429, 500},
+    "getBuildJob": {200, 400, 403, 404},
+    "cancelBuildJob": {200, 400, 403, 404, 409},
     "getBuildManifest": {200, 400, 404, 500},
     "getBuildSpecSnapshot": {200, 400, 403, 404, 500},
     "listBuilds": {200, 400},
@@ -582,6 +629,15 @@ _OPERATION_STATUS_CODES: dict[str, set[int]] = {
     "listBuildStages": {200, 400, 403, 404},
     "getBuildStageDetail": {200, 400, 403, 404},
     "getBuildQuality": {200, 400, 403, 404},
+    "getQualitySummary": {200, 400},
+    "getBuildEvents": {200, 400, 403, 404},
+    "getPublishReadiness": {200, 400, 403, 404},
+    "publishBuild": {200, 400, 403, 404, 409, 502},
+    "getMonitoringSummary": {200},
+    "getMonitoringBuilds": {200, 400},
+    "createUpload": {200, 400, 403, 413},
+    "getUpload": {200, 403, 404},
+    "deleteUpload": {200, 403, 404},
 }
 
 
@@ -632,6 +688,36 @@ def test_declared_status_codes_match_implementation() -> None:
             f"  실제 구현: {sorted(all_implemented_codes)}\n"
             f"  차이: {sorted(declared_codes ^ all_implemented_codes)}"
         )
+
+
+def test_publish_request_contract_matches_huggingface_runtime() -> None:
+    """#491 HTTP target/options와 실제 fail-closed runtime 계약을 고정한다."""
+    contract = _load_contract()
+    schemas = contract["components"]["schemas"]
+    assert schemas["PublishTarget"]["enum"] == ["huggingface"]
+    assert schemas["PublishRequest"]["additionalProperties"] is False
+    hf_options = schemas["PublishHuggingFaceOptions"]
+    assert hf_options["additionalProperties"] is False
+    assert hf_options["properties"]["private"] == {
+        "type": "boolean",
+        "default": True,
+    }
+
+    operation = contract["paths"]["/builds/{run_id}/publish"]["post"]
+    example = operation["requestBody"]["content"]["application/json"]["examples"]["HuggingFace"][
+        "value"
+    ]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert validate(example, schema, contract) == []
+    assert validate(
+        {
+            "target": "huggingface",
+            "destination": "owner/dataset",
+            "options": {"visibility": "private"},
+        },
+        schema,
+        contract,
+    )
 
 
 def _extract_response_schema_required_fields(
@@ -1125,3 +1211,143 @@ class TestResponseConformance:
         resp = dispatch(_conform_service(tmp_path), "GET", "/builds/nope/quality", None)
         assert resp.status_code == 404
         _assert_conforms(resp, "/builds/{run_id}/quality", "GET")
+
+    # -------------------------------------------------------------------
+    # Run Event Timeline API conformance (#496)
+    # -------------------------------------------------------------------
+
+    def test_build_events_200(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-ev"})
+        resp = dispatch(service, "GET", "/builds/conform-ev/events", None)
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/builds/{run_id}/events", "GET")
+
+    def test_build_events_200_with_limit_and_tail(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        dispatch(
+            service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-ev-tail"}
+        )
+        resp = dispatch(
+            service,
+            "GET",
+            "/builds/conform-ev-tail/events",
+            None,
+            query="limit=2&tail=true",
+        )
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/builds/{run_id}/events", "GET")
+
+    def test_build_events_404_missing(self, tmp_path: Path) -> None:
+        resp = dispatch(_conform_service(tmp_path), "GET", "/builds/nope/events", None)
+        assert resp.status_code == 404
+        _assert_conforms(resp, "/builds/{run_id}/events", "GET")
+
+    def test_build_events_400_bad_limit(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        dispatch(
+            service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-ev-400"}
+        )
+        resp = dispatch(service, "GET", "/builds/conform-ev-400/events", None, query="limit=0")
+        assert resp.status_code == 400
+        _assert_conforms(resp, "/builds/{run_id}/events", "GET")
+
+    def test_build_events_400_bad_tail(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        dispatch(
+            service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-ev-tail-400"}
+        )
+        resp = dispatch(
+            service, "GET", "/builds/conform-ev-tail-400/events", None, query="tail=yes"
+        )
+        assert resp.status_code == 400
+        _assert_conforms(resp, "/builds/{run_id}/events", "GET")
+
+    def test_monitoring_summary_200(self, tmp_path: Path) -> None:
+        resp = dispatch(_conform_service(tmp_path), "GET", "/monitoring/summary", None)
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/monitoring/summary", "GET")
+
+    def test_monitoring_summary_200_after_build(self, tmp_path: Path) -> None:
+        # 요청 처리 후 latency 표본이 기록되어도 계약을 벗어나지 않는지 확인.
+        service = _conform_service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-mon"})
+        resp = dispatch(service, "GET", "/monitoring/summary", None)
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/monitoring/summary", "GET")
+        assert resp.body["api"]["sample_count"] >= 1  # type: ignore[index]
+
+    def test_monitoring_builds_200_empty(self, tmp_path: Path) -> None:
+        resp = dispatch(_conform_service(tmp_path), "GET", "/monitoring/builds", None, query="")
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/monitoring/builds", "GET")
+
+    def test_monitoring_builds_200_after_build(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        dispatch(service, "POST", "/build", {"spec": _CONFORM_SPEC_YAML, "run_id": "conform-mon-b"})
+        resp = dispatch(service, "GET", "/monitoring/builds", None, query="window=24h&bucket=hour")
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/monitoring/builds", "GET")
+
+    def test_monitoring_builds_400_bad_window(self, tmp_path: Path) -> None:
+        resp = dispatch(
+            _conform_service(tmp_path), "GET", "/monitoring/builds", None, query="window=7d"
+        )
+        assert resp.status_code == 400
+        _assert_conforms(resp, "/monitoring/builds", "GET")
+
+    def test_monitoring_builds_400_bad_bucket(self, tmp_path: Path) -> None:
+        resp = dispatch(
+            _conform_service(tmp_path), "GET", "/monitoring/builds", None, query="bucket=day"
+        )
+        assert resp.status_code == 400
+        _assert_conforms(resp, "/monitoring/builds", "GET")
+
+    def test_create_upload_200(self, tmp_path: Path) -> None:
+        resp = dispatch(
+            _conform_service(tmp_path),
+            "POST",
+            "/uploads",
+            None,
+            query="format=csv&filename=trades.csv",
+            raw_body=b"a,b\n1,2\n",
+        )
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/uploads", "POST")
+
+    def test_create_upload_400_missing_format(self, tmp_path: Path) -> None:
+        resp = dispatch(
+            _conform_service(tmp_path), "POST", "/uploads", None, raw_body=b"a,b\n1,2\n"
+        )
+        assert resp.status_code == 400
+        _assert_conforms(resp, "/uploads", "POST")
+
+    def test_get_upload_200(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        created = dispatch(
+            service, "POST", "/uploads", None, query="format=csv", raw_body=b"a,b\n1,2\n"
+        )
+        upload_id = cast(str, created.body["upload_id"])
+        resp = dispatch(service, "GET", f"/uploads/{upload_id}", None)
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/uploads/{upload_id}", "GET")
+
+    def test_get_upload_404_missing(self, tmp_path: Path) -> None:
+        resp = dispatch(_conform_service(tmp_path), "GET", f"/uploads/upl_{'0' * 32}", None)
+        assert resp.status_code == 404
+        _assert_conforms(resp, "/uploads/{upload_id}", "GET")
+
+    def test_delete_upload_200(self, tmp_path: Path) -> None:
+        service = _conform_service(tmp_path)
+        created = dispatch(
+            service, "POST", "/uploads", None, query="format=csv", raw_body=b"a,b\n1,2\n"
+        )
+        upload_id = cast(str, created.body["upload_id"])
+        resp = dispatch(service, "DELETE", f"/uploads/{upload_id}", None)
+        assert resp.status_code == 200
+        _assert_conforms(resp, "/uploads/{upload_id}", "DELETE")
+
+    def test_delete_upload_404_missing(self, tmp_path: Path) -> None:
+        resp = dispatch(_conform_service(tmp_path), "DELETE", f"/uploads/upl_{'0' * 32}", None)
+        assert resp.status_code == 404
+        _assert_conforms(resp, "/uploads/{upload_id}", "DELETE")

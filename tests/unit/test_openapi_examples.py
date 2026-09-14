@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -154,8 +155,7 @@ def test_examples_are_secret_safe_and_have_no_internal_absolute_paths() -> None:
     assert credential == {"credential": "replace-with-your-provider-key"}
 
 
-def test_query_example_has_1_9_0_result_fields() -> None:
-    # 1.9.0(#523)에서 child startup/engine 실행 시간 필드가 /query 응답에 추가됐다.
+def test_query_example_has_main_1_9_0_result_fields() -> None:
     result = _example("/query", "post", "response:200", "AveragePm10Result")
     assert set(result) == {
         "columns",
@@ -168,15 +168,22 @@ def test_query_example_has_1_9_0_result_fields() -> None:
 
 
 def test_extraction_script_emits_documented_json_shape() -> None:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp949"
     completed = subprocess.run(
         [sys.executable, str(_SCRIPT_PATH)],
         cwd=_ROOT,
         check=True,
         capture_output=True,
         text=True,
+        # 스크립트가 ensure_ascii=False(한글 원문)로 출력하므로 Windows cp949
+        # 기본 디코딩을 쓰지 않는다(#553).
+        encoding="utf-8",
+        env=env,
     )
     payload = json.loads(completed.stdout)
-    assert payload["contract_version"] == "1.9.0"
+    assert "—" in completed.stdout
+    assert payload["contract_version"] == "1.22.0"
     assert len(payload["examples"]) >= 50
     assert set(payload["examples"][0]) == {
         "path",
@@ -200,8 +207,8 @@ class _ExampleQueryService:
             ),
             False,
             7,
-            3,
-            4,
+            12,
+            5,
         )
 
 

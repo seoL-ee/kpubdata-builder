@@ -1,11 +1,11 @@
-"""빌드 인덱스 (#309, ADR 0003; 백엔드 분리 ADR 0010/0013).
+"""빌드 인덱스 (#309, ADR 0003; 백엔드 분리 ADR 0010/0016).
 
 완료된 빌드의 메타데이터를 인덱싱하여 목록 조회 성능을 개선한다.
 manifest.json이 정본이며, 이 인덱스는 파생물이다.
 
 ``BuildIndex`` 는 Protocol(인터페이스)이고, 기본 구현체는 단일 파일 SQLite 기반
 ``SqliteBuildIndex`` 다(무외부의존 기본값). CUBRID 백엔드(``CubridBuildIndex``,
-ADR 0013)는 ``build_index_cubrid`` 에 있으며 ``make_build_index()`` 팩토리가
+ADR 0016)는 ``build_index_cubrid`` 에 있으며 ``make_build_index()`` 팩토리가
 ``KPUBDATA_BUILDER_STORAGE_BACKEND`` 에 따라 선택한다.
 """
 
@@ -57,7 +57,7 @@ class BuildEntry:
 
 
 class BuildIndex(Protocol):
-    """빌드 인덱스 인터페이스 (ADR 0010/0013).
+    """빌드 인덱스 인터페이스 (ADR 0010/0016).
 
     ``SqliteBuildIndex``(기본)와 ``CubridBuildIndex`` 가 이 Protocol 을 구현한다.
     ADR 0003 계약: manifest.json 이 정본, 인덱스는 파생물이며 인덱스 쓰기 실패가
@@ -81,6 +81,14 @@ class BuildIndex(Protocol):
     def list_builds(self, limit: int | None = 50) -> list[BuildEntry]: ...
 
     def list_by_dataset(self, dataset_id: str, limit: int | None = None) -> list[BuildEntry]: ...
+
+    def list_recent_owned(
+        self, *, limit: int, principal_owner_id: str | None, principal_label: str
+    ) -> list[BuildEntry]: ...
+
+    def list_between(self, start_iso: str, end_iso: str) -> list[BuildEntry]: ...
+
+    def latest_successful_finished_at(self) -> str | None: ...
 
     def get(self, run_id: str) -> BuildEntry | None: ...
 
@@ -311,6 +319,142 @@ class SqliteBuildIndex:
             for row in cur
         ]
 
+    def list_recent_owned(
+        self, *, limit: int, principal_owner_id: str | None, principal_label: str
+    ) -> list[BuildEntry]:
+        """principal 소유 build만 최신 완료 순으로 최대 ``limit``개 반환한다 (#527).
+
+        ownership 필터를 Python에서 전체 결과에 사후 적용하기 전에 LIMIT을
+        걸면(예: 전역 최신 10건을 먼저 가져온 뒤 필터링), 다른 principal의
+        최신 run들이 LIMIT을 다 채워 본인의 recent run이 잘릴 수 있다 — 이
+        메서드는 필터를 SQL WHERE로 LIMIT보다 먼저 적용해 그 문제를 없앤다.
+
+        정책은 ``service.auth.principal_owns()``(#505)와 정확히 동일해야
+        한다:
+
+        - 레코드와 principal 양쪽 모두 ``owner_id``가 있으면 그 값을 비교한다
+          (``principal_owner_id``가 아닌 경우에만).
+        - 그 외(레코드에 ``owner_id``가 없거나 principal에 ``owner_id``가
+          없음)에는 ``created_by == principal_label``로 폴백한다.
+        - 어느 쪽도 매치하지 않으면 제외한다(fail-closed) — SQL의 NULL 비교는
+          자연히 조건을 만족시키지 않으므로 별도 처리가 필요 없다.
+
+        Args:
+            limit: 반환할 최대 빌드 수.
+            principal_owner_id: 요청 principal의 canonical stable owner_id.
+                ``None``이면(legacy/owner_id 미설정 principal) 레코드
+                ``owner_id``와 무관하게 항상 ``created_by`` 비교로 폴백한다
+                (``principal_owns()``와 동일).
+            principal_label: 요청 principal의 legacy 비교용 label
+                (``Principal.label``).
+
+        Returns:
+            BuildEntry 목록 (finished_at 내림차순, 최대 limit개).
+        """
+        if principal_owner_id is not None:
+            sql = """
+                SELECT run_id, status, started_at, finished_at, spec_digest, error, created_by,
+                       dataset_id, owner_id
+                FROM builds
+                WHERE (owner_id IS NOT NULL AND owner_id = ?)
+                   OR (owner_id IS NULL AND created_by = ?)
+                ORDER BY finished_at DESC
+                LIMIT ?
+            """
+            params: tuple[object, ...] = (principal_owner_id, principal_label, limit)
+        else:
+            sql = """
+                SELECT run_id, status, started_at, finished_at, spec_digest, error, created_by,
+                       dataset_id, owner_id
+                FROM builds
+                WHERE created_by = ?
+                ORDER BY finished_at DESC
+                LIMIT ?
+            """
+            params = (principal_label, limit)
+        cur = self._conn.execute(sql, params)
+        return [
+            BuildEntry(
+                run_id=row[0],
+                status=cast(BuildStatus, row[1]),
+                started_at=row[2],
+                finished_at=row[3],
+                spec_digest=row[4],
+                error=row[5],
+                created_by=row[6],
+                dataset_id=row[7],
+                owner_id=row[8],
+            )
+            for row in cur
+        ]
+
+    def list_between(self, start_iso: str, end_iso: str) -> list[BuildEntry]:
+        """``[start_iso, end_iso)`` 반열린 구간에 완료된 빌드를 오름차순으로 반환한다 (#516).
+
+        ``finished_at``이 문자열 비교로 구간 안에 드는 행에 더해 ``finished_at``이
+        NULL인 행도 함께 반환한다 — SQL에서는 어느 구간에 속하는지 판정할 수 없는
+        값이므로 침묵하며 제외하지 않고 호출자에게 넘겨 malformed로 셀 수 있게
+        한다(#516 partial 판정). ISO 8601 UTC(``Z`` suffix, zero-padded) 형식이면
+        문자열 정렬이 시각 정렬과 일치하지만, 그 형식을 벗어나면서 문자열 정렬상
+        구간 밖으로 벗어나는 극단적인 legacy 값은 이 쿼리 자체에서 걸러질 수 있다
+        — 실제 배포에서 malformed 값은 대체로 같은 날짜 prefix를 공유하는 손상된
+        ISO 문자열(NULL 포함)이라 이 한계는 좁다. ``idx_builds_finished_at``
+        인덱스를 활용해 테이블 전체를 로드하지 않는다.
+
+        Args:
+            start_iso: 구간 시작(포함), ISO 8601 UTC 문자열.
+            end_iso: 구간 끝(제외), ISO 8601 UTC 문자열.
+
+        Returns:
+            BuildEntry 목록 (finished_at 오름차순, NULL은 먼저 온다).
+        """
+        cur = self._conn.execute(
+            """
+            SELECT run_id, status, started_at, finished_at, spec_digest, error, created_by,
+                   dataset_id, owner_id
+            FROM builds
+            WHERE finished_at IS NULL OR (finished_at >= ? AND finished_at < ?)
+            ORDER BY finished_at ASC
+            """,
+            (start_iso, end_iso),
+        )
+        return [
+            BuildEntry(
+                run_id=row[0],
+                status=cast(BuildStatus, row[1]),
+                started_at=row[2],
+                finished_at=row[3],
+                spec_digest=row[4],
+                error=row[5],
+                created_by=row[6],
+                dataset_id=row[7],
+                owner_id=row[8],
+            )
+            for row in cur
+        ]
+
+    def latest_successful_finished_at(self) -> str | None:
+        """가장 최근 성공(``status='ok'``) 빌드의 ``finished_at``을 반환한다 (#516).
+
+        Artifact Store의 ``last_write_at`` 근거로 쓰인다 — 실제 성공한 빌드가
+        artifact를 기록했다는 확실한 증거만 반환하며, 성공 기록이 없으면
+        ``None``이다("모른다"를 임의 값으로 채우지 않는다). ``idx_builds_finished_at``
+        인덱스를 활용하는 bounded 쿼리다.
+
+        Returns:
+            ISO 8601 문자열 또는 성공 기록이 없으면 None.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT finished_at FROM builds
+            WHERE status = 'ok' AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        return cast(str | None, row[0]) if row is not None else None
+
     def get(self, run_id: str) -> BuildEntry | None:
         """특정 빌드를 조회한다.
 
@@ -380,6 +524,7 @@ def _iter_manifest_entries(output_root: Path) -> Iterator[BuildEntry]:
 
     import yaml
 
+    from ..manifest import status_from_manifest
     from ..spec.serializer import BUILDSPEC_SNAPSHOT_FILENAME, compute_spec_digest
 
     if not output_root.exists():
@@ -397,7 +542,10 @@ def _iter_manifest_entries(output_root: Path) -> Iterator[BuildEntry]:
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             continue
 
-        status: BuildStatus = "failed" if manifest.get("errors") else "ok"
+        # manifest.json이 정본이므로 파생 규칙은 manifest 패키지가 소유한다 (#481) —
+        # 취소된 run은 errors가 비어 있을 수 있어, 기존 "errors 유무" 파생만으로는
+        # 재구축 시 성공(ok)으로 잘못 승격된다.
+        status = cast(BuildStatus, status_from_manifest(manifest))
         snapshot_path = run_dir / BUILDSPEC_SNAPSHOT_FILENAME
         spec_digest: str | None = None
         dataset_id: str | None = None
@@ -500,7 +648,7 @@ def _rebuild_cubrid(output_root: Path) -> int:
 
 
 def rebuild_index(output_root: Path) -> int:
-    """파일시스템 스캔으로 인덱스를 재구축한다 (백엔드 인지, ADR 0013).
+    """파일시스템 스캔으로 인덱스를 재구축한다 (백엔드 인지, ADR 0016).
 
     manifest.json 정본을 스캔해 파생 인덱스를 다시 채운다. 백엔드에 따라:
     - sqlite: .tmp 에 빌드 후 원자적 rename 교체(#366).
@@ -520,7 +668,7 @@ def rebuild_index(output_root: Path) -> int:
 
 
 def make_build_index(output_root: Path) -> BuildIndex:
-    """선택된 백엔드에 맞는 ``BuildIndex`` 구현체를 생성한다 (ADR 0013).
+    """선택된 백엔드에 맞는 ``BuildIndex`` 구현체를 생성한다 (ADR 0016).
 
     sqlite(기본) → ``SqliteBuildIndex(output_root)``; cubrid → 전역 Engine 을 공유하는
     ``CubridBuildIndex``. cubrid 모듈(및 sqlalchemy)은 cubrid 분기에서만 import 된다.

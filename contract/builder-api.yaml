@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KPubData Builder Service API
-  version: "1.9.0"
+  version: "1.22.0"
   description: >-
     Builder 중심 서비스 계약. BuildSpec 검증, preview, build 실행, artifact 조회,
     계약 버전 조회를 제공한다. CLI와 HTTP service mode(#36)가 동일한 도메인 계약을
@@ -18,13 +18,81 @@ info:
     구분한다(#514, additive). v1.7.0은 Silver/Gold read-only `/query`를
     추가한다(#504, additive). v1.8.0은 stable principal별 encrypted Provider
     credential CRUD와 Provider status/test API를 추가한다(#492, additive). v1.9.0은
-    `POST /preview`에 Source↔Silver diff와 sample_mode(first/random) 옵션을
-    추가한다(#497, additive — 기존 필드는 유지된다). `limit`의 상한(1000)을
+    `/query` 응답에 child startup과 Polars engine 실행 시간을 추가한다(#523, additive).
+    v1.10.0은 `POST /preview`에 Source↔Silver diff와 sample_mode(first/random)
+    옵션을 추가한다(#497, additive — 기존 필드는 유지된다). `limit`의 상한(1000)을
     새로 도입해 그 이상 값을 요청하면 400을 반환한다(behavioral tightening;
     이전에는 상한이 없었다). `limit`이 행 수만 제한하므로 wide dataset에서
     `diffs` 자체가 무제한 커질 수 있어, `diffs`도 별도 상한(1000)으로 자르고
-    `diff_truncated`로 명시한다 — `transform_summary`의 집계는 잘리지 않는다. 아울러
-    `/query` 응답에 child startup과 Polars engine 실행 시간을 추가한다(#523, additive).
+    `diff_truncated`로 명시한다 — `transform_summary`의 집계는 잘리지 않는다.
+    v1.11.0은 `GET /monitoring/summary`와 `GET /monitoring/builds`를
+    추가한다(#516, additive — 기존 엔드포인트는 변경되지 않는다). Studio
+    Monitoring 화면을 위한 시스템/집계 observability만 다루며 Run 단위 이벤트는
+    별도(#496)다. Async build queue/worker 상태는 기존
+    `AsyncBuildExecutor`/`AsyncBuildJobRegistry`(#511/#513)의 read-only
+    snapshot을 반영한다 — 정상 Builder runtime에서는 `availability: available`
+    이며 실제 0건과 `unavailable`을 구분한다. Builder API latency는
+    healthy/degraded 임계값 근거가 없어 판정 없이 raw
+    `sample_count`/`p95_latency_ms`만 제공한다. 대신
+    `MonitoringSummaryResponse.status`(`healthy`/`degraded`)는 required
+    subsystem(`api`/`queue`/`workers`/`artifact_store`)의 availability로부터
+    계산되는 deterministic aggregate이며 latency threshold는 사용하지 않는다.
+    Provider 상태는 요청마다 네트워크 프로브를 유발하므로(#492) 이번
+    버전에서는 응답에도, aggregate status 판정에도 포함하지 않는다.
+    v1.12.0은 BuildSpec.composition(JoinSpec)과 POST /build 응답의 composition
+    키, manifest.composition(CompositionProvenance)을 추가한다(#506, additive
+    — 기존 필드/엔드포인트는 변경되지 않는다). v1.13.0은 Public API·File·URL
+    source를 동일한 canonical contract와
+    Bronze→Silver→Gold pipeline으로 처리한다(#498, additive). BuildSpec
+    `sources[]`에 `kind`(`public_api`/`file`/`url`)를 추가하며, `kind`를 생략한
+    기존 source는 항상 `public_api`로 해석되어 기존 동작이 그대로 유지된다.
+    `kind="file"` source를 위해 `POST /uploads`, `GET /uploads/{upload_id}`,
+    `DELETE /uploads/{upload_id}`를 추가한다 — 업로드는 principal의 owner_id로
+    격리되고 서버가 즉시 파싱 가능성을 검증한다. `kind="url"` source는 P0
+    범위(GET, Auth=None, https만 허용)로 SSRF를 방어하는 safe fetch(DNS
+    재검증, redirect마다 재검증, 응답 크기 상한)를 거친다. 두 kind 모두 기존
+    Bronze artifact/provenance 계약을 그대로 재사용하며, provenance/manifest에
+    로컬 파일 경로나 쿼리스트링 secret을 남기지 않는다.
+    v1.14.0은 `GET /builds/{run_id}/events`를 추가한다(#496, additive — 기존
+    엔드포인트는 변경되지 않는다). run 실행 과정(submitted/started/finished/
+    failed, source fetch started/completed/failed, medallion
+    stage(bronze/silver/gold/export) started/completed/failed, quality
+    checkpoint)을 raw logger parsing 없이 append-only structured event
+    timeline으로 조회한다. `limit`(기본 200, 상한 1000)과 `tail`로 bounded
+    query를 제공하며, 반환은 항상 chronological ascending이다. event의
+    ordering identifier(`seq`)는 store가 append 시점에 부여하는 monotonic
+    값이라 병렬 source 간 실제 append 순서를 손실 없이 보존한다. Monitoring
+    (#516, `GET /monitoring/summary`·`GET /monitoring/builds`)은 시스템/집계
+    observability를 다루고, 이 endpoint는 단일 run의 event만 다룬다 — 역할이
+    분리되어 있다. v1.15.0은 `/catalog` 응답(CatalogDataset)에 탐색용
+    metadata(`description`/`tags`/`source_url`/`representation`/`operations`/
+    `query_support`)를 추가한다(#490, additive — 기존 필드는 유지되며
+    raw_metadata는 노출하지 않는다).
+    v1.16.0은 async build job 표면을 계약에 문서화한다 — `POST /builds`(202
+    접수/200 idempotent 재제출(#513)/409 완료 run 충돌/429 queue full)와
+    `GET /builds/{run_id}`(잡 상태 polling, 성공 잡의 최종 build 응답 포함)을
+    추가한다(#480, additive). 잡 상태 조회에 ownership 게이트를 적용해
+    cross-owner의 build 출력 노출을 차단한다(behavioral tightening — 이전에는
+    미검사였음).
+    v1.17.0은 build publish 표면을 추가한다(#491) — `GET /builds/{run_id}/publish/readiness`(ready/blockers/warnings)와 `POST /builds/{run_id}/publish`(idempotent publish receipt, TOCTOU 재검사)를 추가한다(additive). HTTP target은 `huggingface`로 한정한다.
+    v1.21.0은 publish 감사 로그 조회를 추가한다(#563, additive) — `GET /builds/{run_id}/publish/audit`(reconcile/reset 이력, 소유권 게이트, receipt 삭제 후에도 조회).
+    v1.22.0은 `GET /datasets` 응답에 `total`을 추가한다(#488 후속, additive — 기존 필드/동작은 변경되지 않는다). `total`은 canonical dataset grouping과 ownership 필터를 적용한 뒤 pagination(limit) 이전의 접근 가능한 distinct dataset_id 개수이며, Studio Home의 DATASETS KPI가 `datasets` 길이나 limit을 total로 오인하지 않도록 authoritative aggregate를 제공한다. 같은 릴리스 범위에서 `/catalog` 응답의 `CatalogDataset`에 `request_parameters`와 `application`도 추가한다(additive — 기존 필드/동작은 변경되지 않는다). `raw_metadata`의 요청 파라미터 설명을 secret-free allowlist(`name`/`required`/`description`/`example`)로 직렬화한 것으로, `serviceKey` 등 시크릿 파라미터는 제외된다. Add Data가 선택한 Dataset의 필수 요청 파라미터를 사전에 안내하는 데 쓴다. metadata가 없는 dataset은 빈 배열. `application`은 공공데이터포털처럼 API Key 발급과 Dataset별 활용신청이 별개일 수 있는 경우의 안내(`{required, url}`)로, `raw_metadata.application`에서 그대로 전달하며 없으면 null이다 — Studio는 신청 완료/승인 여부를 추측하지 않는다.
+    v1.20.0은 HTTP publish target 어휘를 확장한다(#550, additive) — `kaggle`(packaging의 `dataset-metadata.json` `id`가 destination과 일치해야 하며 `public` option 허용)과 `local`(`KPUBDATA_BUILDER_LOCAL_PUBLISH_ROOT` 안의 상대 `owner/name` 경로만 허용). `GET /publish/readiness`의 `destination` query는 선택이다.
+    v1.19.0은 publish receipt 운영 경로를 추가한다(#551, additive) — `GET /builds/{run_id}/publish/receipt`(상태 조회, 소유자 불일치는 404), `POST /builds/{run_id}/publish/reconcile`(원격 상태 확인 후 `succeeded` 확정 또는 reset으로 재게시 허용; 판단 불가 시 503로 무변경), `DELETE /builds/{run_id}/publish/receipt`(명시적 reset, 감사 로그 기록).
+    v1.18.0은 ADR 0008의 협력적 취소(cooperative cancellation)를 구현한다 —
+    `POST /builds/{run_id}/cancel`을 추가한다(#481, additive). `queued` job은
+    worker가 runner를 실행하기 전에 곧바로 `cancelled`로 종결되고(파이프라인
+    산출물 0개), `running` job은 `cancelling`을 거쳐 **안전한 stage
+    경계**(Bronze/Silver/Gold 산출물이 기록된 뒤, 다음 stage 시작 전)에서
+    `cancelled`로 종결된다. worker thread를 강제로 죽이지 않으며, 실행 중인
+    stage를 중간에 끊지 않는다. 이미 `succeeded`/`failed`인 job이나 파이프라인이
+    정상 종료로 확정한 job에 대한 취소 요청은 409다. `BuildJobStatus` 어휘는
+    기존 값을 그대로 재사용하며 새 상태를 만들지 않는다. 부분 산출물은 기본적으로
+    삭제하지 않고 partial manifest와 함께 보존한다 — `BuildManifest`에
+    `status`(`ok`/`failed`/`cancelled`)와 `partial`을 additive로 추가해, 취소된
+    run이 성공 run으로 오인되지 않고 실행되지 않은 stage가 성공으로 기록되지
+    않는다. run event 어휘에는 `run_cancelled`가 추가되며(run당 정확히 한 번,
+    terminal 확정 시점) `BuildSummary.status`에도 `cancelled`가 관측 가능해진다.
 servers:
   - url: http://localhost:8000
     description: 로컬 builder 개발 서버
@@ -74,22 +142,57 @@ paths:
                 $ref: "#/components/schemas/CatalogResponse"
               examples:
                 PublicDataCatalog:
-                  summary: 인증 필요 여부를 포함한 공공데이터 카탈로그
+                  summary: 탐색용 metadata를 포함한 공공데이터 카탈로그
                   value:
                     providers:
                       - name: datago
                         datasets:
                           - name: air_quality
                             title: 대기오염정보
+                            description: 측정소별 대기오염 물질 농도 조회
+                            tags: [environment, air]
+                            source_url: https://www.data.go.kr/data/15073861/openapi
+                            representation: api_json
+                            operations: [get, list]
+                            query_support:
+                              pagination: offset
+                              filterable_fields: [station_name]
+                              sortable_fields: []
+                              time_range: true
+                              max_page_size: 1000
                             requires_service_key: true
+                            request_parameters:
+                              - name: sidoName
+                                required: true
+                                description: 조회할 시·도
+                                example: 서울
+                            application:
+                              required: true
+                              url: https://www.data.go.kr/data/15073861/openapi.do
                           - name: village_fcst
                             title: 단기예보
+                            description: null
+                            tags: []
+                            source_url: null
+                            representation: api_json
+                            operations: [list]
+                            query_support: null
                             requires_service_key: true
+                            request_parameters: []
+                            application: null
                       - name: ecos
                         datasets:
                           - name: key_statistic_list
                             title: 주요 경제지표
+                            description: 한국은행 주요 경제지표 시계열
+                            tags: [economy]
+                            source_url: null
+                            representation: api_json
+                            operations: [list]
+                            query_support: null
                             requires_service_key: false
+                            request_parameters: []
+                            application: null
         "401":
           $ref: "#/components/responses/Unauthorized"
         "502":
@@ -312,6 +415,140 @@ paths:
         "503":
           description: encrypted credential store가 구성되지 않음
 
+  /uploads:
+    post:
+      operationId: createUpload
+      summary: kind="file" source(#498)용 파일 업로드
+      description: >-
+        요청 body는 JSON이 아니라 업로드할 파일의 raw bytes다(multipart 대신 동등한
+        binary upload, #498). `format`/`encoding`/`filename`은 query parameter로
+        전달한다. 서버가 즉시 파싱 가능성을 검증해(손상·빈 파일은 400) fail-fast하고,
+        성공하면 서버가 발급한 불투명한 `upload_id`를 반환한다 — 이 값을 BuildSpec의
+        `sources[].upload_id`로 참조한다(형식은 `sources[].format`/`encoding`과
+        정확히 일치해야 한다). content는 요청 principal의 owner_id로 격리되며,
+        원문 content를 다시 내려주는 API는 없다(메타데이터만 조회 가능).
+      parameters:
+        - name: format
+          in: query
+          required: true
+          description: 업로드 content의 파싱 포맷
+          schema:
+            type: string
+            enum: [csv, json, jsonl, parquet]
+        - name: encoding
+          in: query
+          required: false
+          description: 텍스트 포맷(csv/json/jsonl) 디코딩 인코딩. parquet은 무시된다.
+          schema:
+            type: string
+            default: utf-8
+        - name: filename
+          in: query
+          required: false
+          description: >-
+            표시 전용 원본 파일명. 파일시스템 경로로 쓰이지 않으며 응답의
+            original_filename에 basename만 반영된다.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: 업로드 저장 완료
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadMetadata"
+              examples:
+                Uploaded:
+                  summary: csv 업로드 성공
+                  value:
+                    upload_id: upl_0123456789abcdef0123456789abcdef
+                    format: csv
+                    encoding: utf-8
+                    size_bytes: 1024
+                    original_filename: trades.csv
+                    created_at: "2026-08-16T09:00:00+00:00"
+        "400":
+          description: 빈 body, 손상된 content, 지원하지 않는 format, 또는 크기 초과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: stable principal을 확인할 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: 업로드 크기가 서버 상한을 초과함
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /uploads/{upload_id}:
+    get:
+      operationId: getUpload
+      summary: 업로드 메타데이터 조회 (#498, content는 응답에 포함하지 않음)
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+      responses:
+        "200":
+          description: 안전한(secret-free) 업로드 메타데이터
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadMetadata"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: stable principal을 확인할 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 존재하지 않거나 principal 소유가 아닌 upload_id (구분해 노출하지 않음)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      operationId: deleteUpload
+      summary: 현재 principal 소유 업로드 삭제 (#498)
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+      responses:
+        "200":
+          description: 삭제 완료
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadDeleteResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: stable principal을 확인할 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 존재하지 않거나 principal 소유가 아닌 upload_id (구분해 노출하지 않음)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /validate:
     post:
       operationId: validateSpec
@@ -450,25 +687,15 @@ paths:
                             detail: null
                         source_sample:
                           - station_name: 종로구
-                            pm10_value: "31"
+                            pm10_value: 31
                           - station_name: 중구
-                            pm10_value: "28"
+                            pm10_value: 28
                         sample_mode: first
                         diff_available: true
-                        diffs:
-                          - row: 0
-                            column: pm10_value
-                            before: "31"
-                            after: 31
-                            transform: "cast:Int64"
-                          - row: 1
-                            column: pm10_value
-                            before: "28"
-                            after: 28
-                            transform: "cast:Int64"
+                        diffs: []
                         transform_summary:
-                          changed_cells: 2
-                          changed_rows: 2
+                          changed_cells: 0
+                          changed_rows: 0
                         diff_truncated: false
         "400":
           description: 잘못된 요청(spec 누락/검증 실패, limit 타입 오류 등)
@@ -615,6 +842,144 @@ paths:
                   value:
                     error: "run not found: missing-run"
 
+  /builds/{run_id}:
+    get:
+      operationId: getBuildJob
+      summary: 비동기 build job 상태 polling (#482, #480)
+      description: >-
+        active(queued/running) 또는 terminal(succeeded/failed) async build job의
+        상태를 반환한다. 성공한 잡은 `response`에 최종 build 응답 본문을 포함한다.
+        active 구간(run directory/manifest가 아직 없는)도 async job registry로
+        인지하며, ownership 판정은 `/builds/{run_id}/events`와 동일한
+        canonical 규칙(manifest 우선, active는 registry snapshot의 stable
+        owner_id)을 따른다. 잡 상태가 404면 이후에도 상태가 생성되지 않는다 —
+        registry는 프로세스 메모리 상주라 서버 재시작 후 active 잡은 조회되지
+        않는다(#482 restart semantics).
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: build job 상태
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildJob"
+              examples:
+                Running:
+                  summary: 실행 중인 job
+                  value:
+                    run_id: run-0123456789abcdef
+                    status: running
+                    created_at: "2026-08-16T09:00:00+00:00"
+                    updated_at: "2026-08-16T09:00:01+00:00"
+                    created_by: oidc:user-a
+                Succeeded:
+                  summary: 완료된 job(최종 build 응답 포함)
+                  value:
+                    run_id: run-0123456789abcdef
+                    status: succeeded
+                    created_at: "2026-08-16T09:00:00+00:00"
+                    updated_at: "2026-08-16T09:00:07+00:00"
+                    created_by: oidc:user-a
+                    response:
+                      run_id: run-0123456789abcdef
+                      status: ok
+        "400":
+          description: 안전하지 않은 run_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: run 소유자가 아님
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 알려지지 않은 run(완료 run 포함, registry에 없음)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds/{run_id}/cancel:
+    post:
+      operationId: cancelBuildJob
+      summary: 비동기 build job 협력적 취소 요청 (#481, ADR 0008)
+      description: >-
+        active(`queued`/`running`) async build job의 취소를 요청한다. worker
+        thread를 강제로 종료하지 않는다 — `queued` job은 worker가 runner를
+        실행하기 전에 곧바로 `cancelled`로 종결되고(파이프라인 산출물 0개),
+        `running` job은 즉시 `cancelling`으로 표시된 뒤 **안전한 stage
+        경계**(Bronze/Silver/Gold 산출물이 기록된 뒤 다음 stage를 시작하기 전)에서
+        `cancelled`로 종결된다. 실행 중인 stage를 중간에 끊지 않으므로 응답
+        시점에 job이 아직 `cancelling`일 수 있다 — 최종 상태는
+        `GET /builds/{run_id}`로 확인한다. 취소 시점까지 만들어진 산출물은
+        삭제하지 않고 `partial: true` manifest(`status: cancelled`)와 함께
+        보존한다. 이미 `cancelling`/`cancelled`인 job에 다시 요청해도 현재
+        상태를 그대로 200으로 돌려주는 멱등 연산이다. ownership 판정은
+        `GET /builds/{run_id}`와 동일한 canonical 규칙(manifest 우선, active는
+        registry snapshot의 stable owner_id)을 따른다.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: >-
+            취소가 접수됨(또는 이미 취소된 job에 대한 멱등 재요청). 본문은 전이
+            직후의 job 스냅샷이다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildJob"
+              examples:
+                QueuedCancelled:
+                  summary: 실행 전 queued job이 즉시 종결 취소됨
+                  value:
+                    run_id: run-0123456789abcdef
+                    status: cancelled
+                    created_at: "2026-08-16T09:00:00+00:00"
+                    updated_at: "2026-08-16T09:00:02+00:00"
+                    created_by: oidc:user-a
+                RunningCancelling:
+                  summary: running job에 취소를 요청함(다음 안전 경계에서 종결)
+                  value:
+                    run_id: run-0123456789abcdef
+                    status: cancelling
+                    created_at: "2026-08-16T09:00:00+00:00"
+                    updated_at: "2026-08-16T09:00:03+00:00"
+                    created_by: oidc:user-a
+        "400":
+          description: 안전하지 않은 run_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: run 소유자가 아님
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 알려지지 않은 run(registry에 없음)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            더 이상 취소할 수 없는 job — 이미 `succeeded`/`failed`로 끝났거나,
+            파이프라인이 마지막 안전 경계를 지나 정상 종료로 확정했다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /builds/{run_id}/manifest:
     get:
       operationId: getBuildManifest
@@ -737,6 +1102,94 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   /builds:
+    post:
+      operationId: submitBuild
+      summary: 비동기 build job 제출 (#482, ADR 0008 #480)
+      description: >-
+        BuildSpec을 검증해 async build job으로 큐잉하고 즉시 초기 상태를 반환한다.
+        동일 run_id의 active job이 있으면 idempotent하게 기존 잡 상태를 200으로
+        반환하고(#513), 이미 완료된 run_id면 409, queue가 가득 차면 429를
+        반환한다. 잡의 실행 결과는 `GET /builds/{run_id}`로 polling하고,
+        협력적 취소는 `POST /builds/{run_id}/cancel`(#481)로 요청한다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [spec]
+              properties:
+                spec:
+                  type: string
+                  description: BuildSpec을 YAML로 직렬화한 문자열
+                run_id:
+                  type: string
+                  description: >-
+                    클라이언트 지정 run_id(선택). 생략하면 서버가 발급한다.
+                    안전한 path segment여야 한다.
+            examples:
+              SubmitBuild:
+                summary: 비동기 build 제출
+                value:
+                  spec: |
+                    dataset_id: seoul-air-quality
+                    title: 서울 대기질 관측
+                    description: 서울 지역 측정소별 대기오염 관측 데이터
+                    sources:
+                      - provider: datago
+                        dataset: air_quality
+                        alias: air
+                    exports:
+                      - kind: jsonl
+                        output_path: artifacts/air-quality.jsonl
+      responses:
+        "202":
+          description: build job이 접수되어 큐잉됨
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildJob"
+              examples:
+                Accepted:
+                  summary: 신규 접수된 queued job
+                  value:
+                    run_id: run-0123456789abcdef
+                    status: queued
+                    created_at: "2026-08-16T09:00:00+00:00"
+                    updated_at: "2026-08-16T09:00:00+00:00"
+                    created_by: oidc:user-a
+        "200":
+          description: 동일 run_id의 active job이 이미 존재함(idempotent 재제출, #513)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildJob"
+        "400":
+          description: 잘못된 spec/run_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: run_id가 이미 완료된 run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: async build queue가 가득 참
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: job 접수 실패(event 기록/큐잉 불가 — job은 생성되지 않음)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
       operationId: listBuilds
       summary: "빌드 이력 목록 조회 (최신 수정 시각 기준 내림차순)"
@@ -810,6 +1263,7 @@ paths:
                 BuiltDatasets:
                   summary: dataset_id별 latest accessible run 요약
                   value:
+                    total: 1
                     datasets:
                       - dataset_id: seoul-air-quality
                         title: 서울 대기질 관측
@@ -954,6 +1408,322 @@ paths:
                   summary: run history를 조회할 수 없는 dataset
                   value:
                     error: "dataset not found: unknown-dataset"
+
+  /builds/{run_id}/events:
+    get:
+      operationId: getBuildEvents
+      summary: >-
+        run의 append-only structured event timeline 조회 (#496). raw logger를
+        파싱하지 않고, 실제 실행 boundary(run/source fetch/medallion
+        stage/quality checkpoint)에서 남긴 구조화된 event만 반환한다. 반환은
+        항상 chronological ascending이다 — `tail=true`도 최신 `limit`개를
+        고르되 결과 자체는 뒤집지 않는다. 실패했다고 이전 성공 event를
+        지우지 않으므로(append-only), partial run에서도 마지막 정상 event와
+        실패 event를 함께 확인할 수 있다.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: limit
+          in: query
+          required: false
+          description: "반환할 최대 event 수 (기본값: 200, 상한: 1000)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 200
+        - name: tail
+          in: query
+          required: false
+          description: >-
+            true면 run 시작부터가 아니라 가장 최근 `limit`개를 선택한다(반환
+            순서는 여전히 chronological ascending).
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: run_id와 chronological ascending으로 정렬된 event 목록
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildEventsResponse"
+              examples:
+                CompletedRun:
+                  summary: 단일 source가 Bronze→Silver→Gold→Export까지 모두 성공한 run
+                  value:
+                    run_id: air-quality-20260815
+                    events:
+                      - seq: 1
+                        timestamp: "2026-08-15T09:30:00+00:00"
+                        run_id: air-quality-20260815
+                        event: run_started
+                        status: ok
+                        source_key: null
+                        stage: null
+                        message: pipeline execution started
+                        metrics: null
+                      - seq: 2
+                        timestamp: "2026-08-15T09:30:01+00:00"
+                        run_id: air-quality-20260815
+                        event: stage_completed
+                        status: ok
+                        source_key: air
+                        stage: bronze
+                        message: Bronze written
+                        metrics: {records: 84321}
+                      - seq: 3
+                        timestamp: "2026-08-15T09:30:02+00:00"
+                        run_id: air-quality-20260815
+                        event: run_finished
+                        status: ok
+                        source_key: null
+                        stage: null
+                        message: build completed
+                        metrics: null
+                PartialFailure:
+                  summary: 한 source가 bronze fetch에서 실패한 run — 이전 event는 남아 있다
+                  value:
+                    run_id: air-quality-partial
+                    events:
+                      - seq: 1
+                        timestamp: "2026-08-15T09:30:00+00:00"
+                        run_id: air-quality-partial
+                        event: run_started
+                        status: ok
+                        source_key: null
+                        stage: null
+                        message: pipeline execution started
+                        metrics: null
+                      - seq: 2
+                        timestamp: "2026-08-15T09:30:01+00:00"
+                        run_id: air-quality-partial
+                        event: source_fetch_failed
+                        status: fail
+                        source_key: air
+                        stage: null
+                        message: "pipeline failed for source 'air'"
+                        metrics: null
+                      - seq: 3
+                        timestamp: "2026-08-15T09:30:01+00:00"
+                        run_id: air-quality-partial
+                        event: run_failed
+                        status: fail
+                        source_key: null
+                        stage: null
+                        message: 1 source(s) failed
+                        metrics: null
+        "400":
+          description: 경로 안전하지 않은 run_id, 잘못된 limit, 또는 잘못된 tail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 해당 run의 소유자가 아님
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 해당 run을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds/{run_id}/publish/readiness:
+    get:
+      operationId: getPublishReadiness
+      summary: >-
+        run이 target에 게시 가능한지 side-effect-free로 확인한다 (#491). Publisher를
+        호출하거나 원격 dataset을 만들지 않는다. `ready`는 항상 `blockers`가
+        비어 있는지로 deterministic하게 계산되며, `warnings`는 게시 자체를
+        막지 않는다. `POST .../publish`가 같은 판정을 서버에서 다시 수행하므로,
+        이 응답을 신뢰해 blocker 재검증을 건너뛰면 안 된다(TOCTOU).
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: target
+          in: query
+          required: true
+          description: 게시 대상 (기존 publisher registry의 HTTP-safe 부분집합)
+          schema:
+            type: string
+            enum: [huggingface]
+      responses:
+        "200":
+          description: readiness 판정
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishReadinessResponse"
+              examples:
+                Ready:
+                  summary: Gold + license + credential이 모두 준비된 run
+                  value:
+                    run_id: air-quality-20260815
+                    target: huggingface
+                    ready: true
+                    blockers: []
+                    warnings: []
+                Blocked:
+                  summary: license 미선언 + credential 미설정
+                  value:
+                    run_id: air-quality-20260815
+                    target: huggingface
+                    ready: false
+                    blockers:
+                      - code: license_missing
+                        message: >-
+                          BuildSpec.license must be declared before this dataset
+                          can be published (#443)
+                      - code: credential_unavailable
+                        message: no server-side credential is configured for target 'huggingface'
+                    warnings: []
+        "400":
+          description: 경로 안전하지 않은 run_id, target 누락, 또는 지원하지 않는 target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                UnsupportedTarget:
+                  summary: local은 HTTP publish target에서 제외된다(#491)
+                  value:
+                    error: "target 'local' is not available over the publish HTTP API"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 해당 run의 소유자가 아님
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 해당 run을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds/{run_id}/publish:
+    post:
+      operationId: publishBuild
+      summary: >-
+        readiness와 완전히 같은 검사를 서버에서 다시 수행한 뒤 기존 Publisher를
+        호출한다 (#491). blocker가 하나라도 있으면 Publisher는 호출되지 않는다
+        (호출 횟수 0). 새 Publisher를 만들지 않으며, `publishers.PUBLISHER_REGISTRY`
+        (huggingface)의 기존 구현을 그대로 재사용한다. `destination`은
+        filesystem path로 해석되지 않고 target별 canonical identifier(`owner/name`)
+        형태만 허용된다.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishRequest"
+            examples:
+              HuggingFace:
+                value:
+                  target: huggingface
+                  destination: kpubdata/air-quality
+                  options:
+                    private: true
+      responses:
+        "200":
+          description: 게시 성공
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishResponse"
+              examples:
+                Published:
+                  value:
+                    run_id: air-quality-20260815
+                    target: huggingface
+                    publisher: huggingface
+                    destination: kpubdata/air-quality
+                    reference: https://huggingface.co/datasets/kpubdata/air-quality
+                    artifact_count: 3
+                    status: ok
+        "400":
+          description: >-
+            경로 안전하지 않은 run_id, 잘못된 요청 본문, 지원하지 않는 target,
+            잘못된 destination 형태, 또는 target이 지원하지 않는 option
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                InvalidDestination:
+                  summary: destination이 filesystem path처럼 보임(path traversal)
+                  value:
+                    error: "'destination' must not contain path traversal segments"
+                UnknownOption:
+                  summary: huggingface가 지원하지 않는 option
+                  value:
+                    error: "unsupported option for target 'huggingface': 'visibility'"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 해당 run의 소유자가 아님
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 해당 run을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            readiness blocker가 있거나, 동일 operation이 진행/결과 불명 상태이거나,
+            같은 run/target/destination이 다른 options로 이미 게시됨
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PublishBlockedResponse"
+                  - $ref: "#/components/schemas/Error"
+              examples:
+                Blocked:
+                  value:
+                    error: "run is not ready to publish to 'huggingface'"
+                    blockers:
+                      - code: gold_unavailable
+                        message: no successful Gold output is available for this run
+                InProgress:
+                  value:
+                    error: publish operation is already in progress
+                    code: publish_in_progress
+                UnknownState:
+                  value:
+                    error: publish operation outcome is unknown; automatic retry is blocked
+                    code: publish_state_unknown
+                Conflict:
+                  value:
+                    error: this run and destination were already published with different options
+                    code: publish_conflict
+        "502":
+          description: >-
+            기존 Publisher 호출이 실패함(원격 인증/네트워크/provider 오류).
+            Publisher가 던진 예외의 원문 메시지(secret/절대 filesystem path를
+            담을 수 있음)는 절대 그대로 반환하지 않는다(#491) — 항상 이
+            stable generic 메시지와 code만 나간다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                RemoteFailure:
+                  value:
+                    error: "publish failed due to an unexpected error"
+                    code: publish_failed
 
   /builds/{run_id}/stages:
     get:
@@ -1280,6 +2050,57 @@ paths:
                   value:
                     error: "manifest not found: missing-run"
 
+  /quality/summary:
+    get:
+      operationId: getQualitySummary
+      summary: >-
+        최근 window(24h) cross-run quality aggregate (#486 후속, additive — API
+        1.22.0). 접근 가능한 run들의 structured quality를 PASS/WARN/FAIL run 수로
+        요약한다. Studio Home의 "QUALITY WARN (24H)" KPI가 임의 숫자 합성 없이
+        authoritative aggregate를 읽도록 하는 bounded 집계다. 개별 run의
+        `quality_results`/dataset/owner는 노출하지 않는다 — 그건 per-run
+        `GET /builds/{run_id}/quality`의 몫이다. 시스템 observability
+        (`GET /monitoring/summary`·`GET /monitoring/builds`, #516)와 도메인
+        quality를 한 응답에 섞지 않는다. ENFORCE_OWNERSHIP+oidc principal이면
+        본인이 접근 가능한 run만 집계한다(#505). legacy run(BuildSpec snapshot
+        없음)은 structured quality가 없으므로 자연히 제외된다.
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: "집계 기간. 현재 24h만 지원 (기본값: 24h)"
+          schema:
+            type: string
+            enum: [24h]
+            default: 24h
+      responses:
+        "200":
+          description: 최근 window의 PASS/WARN/FAIL run 수
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QualitySummaryResponse"
+              examples:
+                RecentWindow:
+                  summary: 최근 24h에 평가된 run 요약
+                  value:
+                    window: 24h
+                    generated_at: "2026-09-01T09:30:00+00:00"
+                    availability: available
+                    total_runs: 7
+                    evaluated_runs: 5
+                    pass_runs: 3
+                    warn_runs: 2
+                    fail_runs: 1
+        "400":
+          description: 지원하지 않는 window 값
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /query:
     post:
       operationId: queryBuiltDataset
@@ -1309,7 +2130,7 @@ paths:
                 $ref: "#/components/schemas/QueryResponse"
               examples:
                 AveragePm10Result:
-                  summary: bounded row 결과와 1.9.0 실행 시간 필드(#523)
+                  summary: bounded row 결과와 현재 1.9.0 실행 시간 필드
                   value:
                     columns: [station_name, avg_pm10]
                     rows:
@@ -1319,8 +2140,8 @@ paths:
                         avg_pm10: 28.0
                     truncated: false
                     execution_ms: 7
-                    startup_ms: 3
-                    engine_execution_ms: 4
+                    startup_ms: 12
+                    engine_execution_ms: 5
         "400":
           description: invalid context, unsafe SQL, syntax/execution failure
           content:
@@ -1389,6 +2210,68 @@ paths:
                     error: query timed out
                     code: query_timeout
 
+  /monitoring/summary:
+    get:
+      operationId: getMonitoringSummary
+      summary: Builder API/Queue/Worker/Artifact Store 시스템 상태 요약 (#516)
+      description: >-
+        시스템 aggregate만 반환하며 개별 run의 dataset/owner/credential 정보는
+        포함하지 않는다. Async build queue/worker(#511/#513)는 이 서비스가 항상
+        생성하는 AsyncBuildExecutor의 read-only snapshot을 반영하므로 항상
+        `availability: available`이다(#516). Provider 상태는 네트워크 프로브를
+        유발하므로 이번 버전에서는 포함하지 않는다.
+      responses:
+        "200":
+          description: 시스템 상태 요약
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringSummaryResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /monitoring/builds:
+    get:
+      operationId: getMonitoringBuilds
+      summary: 시간대별 build 통계와 recent runs (#516)
+      description: >-
+        BuildIndex(ADR 0003) 기반 파생 집계. timezone은 UTC이며 bucket 경계는
+        `[start, end)` 반열린이다. bucket 기준 timestamp는 `finished_at`이다.
+        ENFORCE_OWNERSHIP+oidc principal일 때는 본인이 접근 가능한 run만
+        집계·노출한다(#505).
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: "집계 기간. 현재 24h만 지원 (기본값: 24h)"
+          schema:
+            type: string
+            enum: [24h]
+            default: 24h
+        - name: bucket
+          in: query
+          required: false
+          description: "집계 단위. 현재 hour만 지원 (기본값: hour)"
+          schema:
+            type: string
+            enum: [hour]
+            default: hour
+      responses:
+        "200":
+          description: build 통계와 recent runs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringBuildsResponse"
+        "400":
+          description: 지원하지 않는 window/bucket 값
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
 components:
   securitySchemes:
     ApiKeyAuth:
@@ -1455,6 +2338,16 @@ components:
       schema:
         type: string
         pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"
+
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      description: >-
+        POST /uploads가 발급한 불투명한 식별자(#498). 사용자가 지정한 값이 아니다.
+      schema:
+        type: string
+        pattern: "^upl_[a-f0-9]{32}$"
 
   schemas:
     Error:
@@ -1594,21 +2487,40 @@ components:
           oneOf:
             - $ref: "#/components/schemas/QualityPolicy"
             - type: "null"
+        composition:
+          description: >-
+            두 source를 join해 하나의 결합 Gold dataset을 추가로 만드는 계약
+            (#506). None이면 기존과 동일하게 source별 독립 Gold만 생성한다.
+          oneOf:
+            - $ref: "#/components/schemas/CompositionSpec"
+            - type: "null"
 
     SourceRef:
       type: object
       description: >-
-        kpubdata provider/dataset 참조. 제거된 normalization_mode 필드는 허용하지
-        않으며 정규화와 검증은 schema 계약으로 선언한다.
+        Canonical source 참조(#498). `kind`로 public_api(기본, 하위 호환)/file/url을
+        구분한다. `kind`를 생략한 source는 항상 `public_api`로 해석되며
+        provider/dataset이 필수다. `file`은 upload_id+format(+encoding)이,
+        `url`은 endpoint(+method+format)가 필수다 — kind별 조건부 필수/금지
+        조합은 OpenAPI object schema로 표현하지 않고(이 계약의 기존 패턴과 동일하게
+        `additionalProperties`로 열어두고) `spec/loader.py`·`validator.py`가
+        엄격히 강제한다. url source는 P0 범위(GET, Auth=None)의 SSRF-safe fetch만
+        허용하며 https가 아닌 scheme·userinfo가 포함된 endpoint는 거부된다.
+        제거된 normalization_mode 필드는 허용하지 않는다.
       additionalProperties: true
       not:
         required: [normalization_mode]
-      required: [provider, dataset]
       properties:
+        kind:
+          type: string
+          enum: [public_api, file, url]
+          default: public_api
         provider:
           type: string
+          description: kind="public_api"에서 필수.
         dataset:
           type: string
+          description: kind="public_api"에서 필수.
         params:
           type: object
           additionalProperties:
@@ -1620,6 +2532,30 @@ components:
           oneOf:
             - $ref: "#/components/schemas/SchemaContract"
             - type: "null"
+        upload_id:
+          type: string
+          pattern: "^upl_[a-f0-9]{32}$"
+          description: kind="file"에서 필수. POST /uploads가 발급한 식별자.
+        format:
+          type: string
+          enum: [csv, json, jsonl, parquet]
+          description: >-
+            kind="file"에서 필수(업로드 시 검증된 format과 정확히 일치해야 함).
+            kind="url"에서는 선택(json/jsonl/csv만 허용, 생략 시 응답
+            Content-Type로 추론).
+        encoding:
+          type: string
+          default: utf-8
+          description: kind="file"에서 텍스트(csv/json/jsonl) 디코딩에 쓰는 인코딩.
+        endpoint:
+          type: string
+          format: uri
+          description: kind="url"에서 필수. https만 허용한다(SSRF 정책, #498).
+        method:
+          type: string
+          enum: [GET]
+          default: GET
+          description: kind="url"에서만 쓰이며 P0는 GET만 허용한다.
 
     SchemaContract:
       type: object
@@ -1640,6 +2576,40 @@ components:
           additionalProperties:
             type: string
           default: {}
+
+    UploadMetadata:
+      type: object
+      description: >-
+        안전한(secret-free) 업로드 메타데이터(#498). content는 절대 포함하지
+        않으며, 이 API로는 원문 content를 다시 조회할 수 없다.
+      required: [upload_id, format, encoding, size_bytes, original_filename, created_at]
+      properties:
+        upload_id:
+          type: string
+          pattern: "^upl_[a-f0-9]{32}$"
+        format:
+          type: string
+          enum: [csv, json, jsonl, parquet]
+        encoding:
+          type: string
+        size_bytes:
+          type: integer
+          minimum: 0
+        original_filename:
+          type: [string, "null"]
+          description: 표시 전용 원본 파일명(파일시스템 경로 아님).
+        created_at:
+          type: string
+          format: date-time
+
+    UploadDeleteResponse:
+      type: object
+      required: [upload_id, deleted]
+      properties:
+        upload_id:
+          type: string
+        deleted:
+          type: boolean
 
     ExportTarget:
       type: object
@@ -1764,6 +2734,53 @@ components:
             $ref: "#/components/schemas/QualityCompareColumnsRule"
           default: []
 
+    JoinSpec:
+      type: object
+      description: >-
+        두 source를 결합하는 equi-join 계약(#506). 초기 범위는 두 source
+        단일 join으로 제한한다 — 3개 이상 join graph, 자유형 SQL join
+        조건은 지원하지 않는다. left/right는 sources[].alias를 참조해야
+        하며, 참조되는 source는 alias를 반드시 선언해야 한다.
+      required: [left, right, left_key, right_key]
+      properties:
+        left:
+          type: string
+          description: 왼쪽 source의 alias (sources[].alias 참조)
+        right:
+          type: string
+          description: 오른쪽 source의 alias
+        left_key:
+          type: string
+          description: 왼쪽 테이블의 join key 컬럼명
+        right_key:
+          type: string
+          description: 오른쪽 테이블의 join key 컬럼명
+        type:
+          type: string
+          enum: [inner, left]
+          default: inner
+        on_duplicate_key:
+          type: string
+          enum: [warn, fail]
+          default: warn
+          description: >-
+            양쪽 join key가 모두 중복 값을 가져(many-to-many) 결과 행이
+            곱셈으로 폭증할 수 있을 때의 처리. warn은 경고만 남기고 결과를
+            만들고, fail은 빌드를 실패시킨다.
+
+    CompositionSpec:
+      type: object
+      description: 여러 source를 하나의 결합 Gold dataset으로 조립하는 계약(#506).
+      required: [name, join]
+      properties:
+        name:
+          type: string
+          description: >-
+            결합 결과 Gold dataset 이름. 다른 source의 output key(alias 또는
+            provider.dataset)와 겹치면 안 된다.
+        join:
+          $ref: "#/components/schemas/JoinSpec"
+
     SpecRequest:
       type: object
       required: [spec]
@@ -1854,14 +2871,129 @@ components:
 
     CatalogDataset:
       type: object
-      required: [name, title, requires_service_key]
+      required:
+        [
+          name,
+          title,
+          description,
+          tags,
+          source_url,
+          representation,
+          operations,
+          query_support,
+          requires_service_key,
+          request_parameters,
+          application,
+        ]
+      description: >
+        DatasetRef의 public/canonical metadata를 allowlist로 직렬화한다 (#490).
+        raw_metadata는 provider 내부 정보/secret이 섞일 수 있어 노출하지 않는다.
+        metadata가 없는 dataset은 description/source_url/query_support가 null,
+        tags/operations가 빈 배열이다.
       properties:
         name:
           type: string
         title:
           type: string
+        description:
+          type: [string, "null"]
+          description: 사람이 읽는 데이터셋 설명 (없으면 null)
+        tags:
+          type: array
+          items:
+            type: string
+          description: 탐색용 분류 태그 (정렬된 문자열 배열, 없으면 빈 배열)
+        source_url:
+          type: [string, "null"]
+          description: 원본 API 문서/데이터 포털 URL (없으면 null)
+        representation:
+          type: string
+          enum: [api_json, api_xml, file_csv, file_excel, sheet, other]
+        operations:
+          type: array
+          items:
+            type: string
+            enum: [list, get, schema, raw, download]
+          description: 지원 작업 (정렬된 문자열 배열, 없으면 빈 배열)
+        query_support:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/CatalogQuerySupport"
+          description: 목록 질의 capability (알려진 경우만, 없으면 null)
         requires_service_key:
           type: boolean
+        request_parameters:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogRequestParameter"
+          description: >
+            선택한 Dataset에 전달하는 요청 파라미터의 secret-free 설명 (#490 후속,
+            additive). raw_metadata에서 allowlist로 추린 것으로 serviceKey 등 시크릿
+            파라미터는 포함되지 않는다. metadata가 없으면 빈 배열.
+        application:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/CatalogApplication"
+          description: >
+            공공데이터포털처럼 API Key 발급과 Dataset별 활용신청이 별개일 수 있는
+            경우의 안내 (#490 후속, additive). raw_metadata.application에서
+            그대로 전달한 것으로, 없으면 null(활용신청이 필요 없다는 뜻이 아니라
+            알려진 바 없음). Studio는 신청 완료/승인 여부를 이 필드로 추측하지 않는다
+            — Preview 성공이 실제 사용 가능 여부의 최종 확인이다.
+
+    CatalogRequestParameter:
+      type: object
+      required: [name, required, description, example]
+      properties:
+        name:
+          type: string
+          description: 요청 파라미터 이름 (시크릿/serviceKey 계열은 제외됨)
+        required:
+          type: boolean
+          description: 이 파라미터가 필수인지
+        description:
+          type: [string, "null"]
+          description: 사람이 읽는 설명 (없으면 null)
+        example:
+          type: [string, "null"]
+          description: 근거 있는 예시 값 (없으면 null)
+
+    CatalogApplication:
+      type: object
+      required: [required, url]
+      description: >
+        Dataset별 활용신청 안내 (API Key 발급과 별개일 수 있음). Studio는 신청
+        완료/승인 상태를 이 필드로 만들어내지 않는다 — 알 수 없으면 알 수 없는
+        상태로 남긴다.
+      properties:
+        required:
+          type: boolean
+          description: 이 Dataset이 API Key 등록과 별도로 활용신청이 필요할 수 있는지
+        url:
+          type: string
+          format: uri
+          description: 공식 Dataset 상세/활용신청 페이지 (http/https만 허용)
+
+    CatalogQuerySupport:
+      type: object
+      required: [pagination, filterable_fields, sortable_fields, time_range, max_page_size]
+      properties:
+        pagination:
+          type: string
+          enum: [offset, index, cursor, none]
+        filterable_fields:
+          type: array
+          items:
+            type: string
+        sortable_fields:
+          type: array
+          items:
+            type: string
+        time_range:
+          type: boolean
+        max_page_size:
+          type: [integer, "null"]
+          minimum: 1
 
     ProviderListResponse:
       type: object
@@ -2298,6 +3430,64 @@ components:
           items:
             $ref: "#/components/schemas/DatasetQualityHistoryEntry"
 
+    QualitySummaryResponse:
+      type: object
+      description: >-
+        최근 window cross-run quality aggregate (#486 후속). 시간 기준은 canonical
+        run timestamp(finished_at, 없으면 started_at)를 UTC로 파싱한
+        `(generated_at - window, generated_at]`이며, 파싱 불가능한 timestamp를 가진
+        run은 창에 놓을 수 없어 제외된다. 미평가/unavailable run을 PASS로 세지
+        않는다.
+      required:
+        - window
+        - generated_at
+        - availability
+        - total_runs
+        - evaluated_runs
+        - pass_runs
+        - warn_runs
+        - fail_runs
+      additionalProperties: false
+      properties:
+        window:
+          type: string
+          enum: [24h]
+        generated_at:
+          type: string
+          description: 집계 기준 시각(UTC, ISO 8601, 초 단위).
+        availability:
+          type: string
+          enum: [available, unavailable]
+          description: >-
+            available: 집계 성공(run 0건이어도 유효). unavailable: 접근 가능한 run
+            목록 자체를 열거하지 못함 — 이때 모든 count는 0이며 "0건"과 구분된다.
+        total_runs:
+          type: integer
+          minimum: 0
+          description: window 안의 접근 가능한 canonical run 수(status 무관).
+        evaluated_runs:
+          type: integer
+          minimum: 0
+          description: >-
+            그 중 structured quality가 실제로 평가된(evaluated_checks > 0) run 수.
+        pass_runs:
+          type: integer
+          minimum: 0
+          description: evaluated run 중 WARN·FAIL 결과가 하나도 없는 run 수.
+        warn_runs:
+          type: integer
+          minimum: 0
+          description: >-
+            evaluated run 중 WARN 결과가 하나 이상인 run 수(같은 run의 WARN check
+            여러 개여도 1). Studio Home "QUALITY WARN (24H)" KPI. fail_runs와
+            독립적이라 겹칠 수 있다.
+        fail_runs:
+          type: integer
+          minimum: 0
+          description: >-
+            evaluated run 중 FAIL 결과가 하나 이상인 run 수. `pass_runs +
+            (WARN 또는 FAIL이 있는 run 수) == evaluated_runs`.
+
     TableStatistics:
       type: object
       required: [row_count, null_counts, duplicate_rate]
@@ -2340,6 +3530,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BuildOutcome"
+        composition:
+          description: BuildSpec.composition이 없으면 null (#506).
+          oneOf:
+            - $ref: "#/components/schemas/CompositionOutcome"
+            - type: "null"
         manifest:
           type: string
           description: 기록된 manifest.json의 경로
@@ -2359,6 +3554,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BuildOutcome"
+        composition:
+          description: BuildSpec.composition이 없으면 null (#506).
+          oneOf:
+            - $ref: "#/components/schemas/CompositionOutcome"
+            - type: "null"
         manifest:
           type: string
           description: partial 정책으로 남은 manifest.json의 경로
@@ -2366,7 +3566,10 @@ components:
           type: string
         error:
           type: string
-          description: 첫 번째 실패 outcome의 error에서 파생된 human-readable 요약 (#226)
+          description: >-
+            첫 번째 실패 outcome의 error에서 파생된 human-readable 요약
+            (#226). 모든 source가 성공하고 composition만 실패한 경우
+            composition.error에서 파생된다 (#506).
 
     ArtifactsResponse:
       type: object
@@ -2393,6 +3596,24 @@ components:
           type: string
         schema_version:
           type: string
+        status:
+          type: string
+          enum: [ok, failed, cancelled]
+          description: >-
+            run의 종단 상태 (#481, additive). `ok`/`failed`는 기존에 `errors`
+            유무로 파생하던 값과 동일하고, `cancelled`는 협력적 취소로 종료된
+            run이다. legacy manifest에는 이 필드가 없다 — reader는 부재 시
+            기존대로 `errors` 유무에서 파생해야 한다. 취소된 run도 이미 실패한
+            source의 사유를 `errors`에 그대로 보존한다(취소가 실패를 삼키지
+            않는다).
+        partial:
+          type: boolean
+          description: >-
+            이 run이 정상 완료 전에 종료되어 `outputs`가 부분 산출물임을 뜻한다
+            (#481, additive). 현재는 `status: cancelled`인 run에만 `true`이며,
+            취소 시점까지 실제로 기록된 산출물만 담긴다 — 실행되지 않은 stage는
+            성공으로 기록되지 않는다. 부분 산출물은 기본적으로 삭제하지
+            않는다(감사/디버깅 목적 보존).
         inputs:
           type: array
           items:
@@ -2438,6 +3659,84 @@ components:
             type: array
             items:
               $ref: "#/components/schemas/SchemaDriftFinding"
+        composition:
+          description: >-
+            BuildSpec.composition으로 두 source를 join한 결과의 출처 추적
+            정보(#506, additive). composition이 없거나 실행되지 않았으면
+            null이다 — legacy manifest reader는 부재와 null을 모두
+            "composition 미사용 run"으로 해석해야 한다.
+          oneOf:
+            - $ref: "#/components/schemas/CompositionProvenance"
+            - type: "null"
+
+    CompositionProvenance:
+      type: object
+      description: composition(join) 실행 결과의 상세 출처 정보 (#506).
+      required:
+        - name
+        - left
+        - right
+        - join_type
+        - left_key
+        - right_key
+        - left_row_count
+        - left_distinct_key_count
+        - right_row_count
+        - right_distinct_key_count
+        - output_row_count
+        - duplicate_key_warning
+      properties:
+        name:
+          type: string
+        left:
+          type: string
+        right:
+          type: string
+        join_type:
+          type: string
+          enum: [inner, left]
+        left_key:
+          type: string
+        right_key:
+          type: string
+        left_row_count:
+          type: integer
+        left_distinct_key_count:
+          type: integer
+          description: 왼쪽 join key의 distinct 값 수 (null 제외)
+        right_row_count:
+          type: integer
+        right_distinct_key_count:
+          type: integer
+          description: 오른쪽 join key의 distinct 값 수 (null 제외)
+        output_row_count:
+          type: integer
+        duplicate_key_warning:
+          type: boolean
+          description: >-
+            양쪽 join key가 모두 중복 값을 가져(many-to-many) 행 폭증 위험이
+            감지됐는지 여부. 실제 처리(경고만/빌드 실패)는 JoinSpec의
+            on_duplicate_key가 결정한다 — 이 필드는 감지 여부만 기록한다.
+
+    CompositionOutcome:
+      type: object
+      description: >-
+        composition(join) 실행 결과 (#506). source별 BuildOutcome과 별도로
+        노출된다 — bronze/silver/gold stage 개념이 적용되지 않고, "combined
+        result"로 명확히 구분되어야 하기 때문이다.
+      required: [name, status, error]
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [ok, failed, skipped]
+          description: >-
+            ok(성공) / failed(join 자체 실행 실패: 키 부재·타입 불일치·명시적
+            fail 게이트) / skipped(참조한 source가 실패해 join을 시도조차
+            못함)
+        error:
+          type: [string, "null"]
 
     BuildSpecSnapshotResponse:
       type: object
@@ -2465,14 +3764,53 @@ components:
           description: 빌드 실행 식별자
         status:
           type: string
-          enum: [ok, failed]
-          description: 빌드 상태
+          enum: [ok, failed, cancelled]
+          description: >-
+            빌드 상태. `cancelled`(#481)는 협력적 취소로 종료된 run이며 부분
+            산출물과 partial manifest가 함께 남는다 — 성공한 빌드로 취급하면
+            안 된다.
         started_at:
           type: [string, "null"]
           description: 빌드 시작 시각 (ISO 8601 또는 null)
         finished_at:
           type: [string, "null"]
           description: 빌드 완료 시각 (ISO 8601 또는 null)
+
+    BuildJob:
+      type: object
+      required: [run_id, status, created_at, updated_at]
+      description: >-
+        비동기 build job 스냅샷 (#482, #480). 프로세스 메모리 상주 registry
+        기반이라 서버 재시작 후 active/terminal 잡은 더 이상 조회되지 않는다.
+        `response`는 성공한 잡의 최종 build 응답 본문이고, `error`는 실패한
+        잡의 사유다. internal `owner_id` 필드는 wire로 노출되지 않는다.
+      properties:
+        run_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, cancelling, succeeded, failed, cancelled]
+          description: >-
+            `POST /builds/{run_id}/cancel`(#481)이 `queued` job을 곧바로
+            `cancelled`로, `running` job을 `cancelling`으로 전이시키고,
+            `cancelling` job은 다음 안전한 stage 경계에서 `cancelled`가 된다.
+            `succeeded`/`failed`/`cancelled`는 종단 상태이며 다시
+            `running`/`cancelling`으로 돌아가지 않는다.
+        created_at:
+          type: string
+          description: job 접수 시각 (ISO 8601)
+        updated_at:
+          type: string
+          description: 마지막 상태 전이 시각 (ISO 8601)
+        created_by:
+          type: [string, "null"]
+          description: 제출 principal의 display/legacy label (선택)
+        response:
+          type: [object, "null"]
+          description: 성공한 잡의 최종 build 응답 본문 (성공 시에만)
+        error:
+          type: [string, "null"]
+          description: 실패 사유 (실패 시에만)
 
     BuildsResponse:
       type: object
@@ -2499,6 +3837,95 @@ components:
         alias:
           type: string
 
+    BuildEventName:
+      type: string
+      description: >-
+        structured run event의 bounded vocabulary (#496). run_submitted은
+        실제 async job submission이 있는 `POST /builds`(비동기)에서만 발생하며
+        동기 `POST /build`에는 없다. run_cancelled(#481)도 async 전용이며 job이
+        실제로 terminal `cancelled`로 확정되는 순간 run당 정확히 한 번만
+        발생한다 — 같은 run에 run_finished/run_failed와 함께 나타나지 않는다.
+        과도기 상태(`cancelling`)는 job status로만 노출되고 별도 event는 없다.
+      enum:
+        - run_submitted
+        - run_started
+        - run_finished
+        - run_failed
+        - run_cancelled
+        - source_fetch_started
+        - source_fetch_completed
+        - source_fetch_failed
+        - stage_started
+        - stage_completed
+        - stage_failed
+        - quality_evaluated
+
+    BuildEventStatus:
+      type: string
+      description: >-
+        event의 결과. ok(성공/정상 완료), warn(quality_evaluated에서 FAIL 없이
+        WARN이 하나 이상), fail(실패).
+      enum: [ok, warn, fail]
+
+    BuildEventStageName:
+      type: string
+      description: 관련 medallion stage. export는 BuildSpec.exports 실행 단계다.
+      enum: [bronze, silver, gold, export]
+
+    BuildEvent:
+      type: object
+      description: >-
+        단일 structured run event(#496). arbitrary object dump, exception
+        객체, stack trace, raw provider response, raw path, credential은
+        담기지 않는다 — message/metrics는 항상 bounded하고 안전하다.
+      required: [seq, timestamp, run_id, event, status, source_key, stage, message, metrics]
+      properties:
+        seq:
+          type: integer
+          description: >-
+            store가 append 시점에 부여하는 monotonic ordering identifier.
+            병렬 source worker의 실제 append 순서를 그대로 보존하며, 존재하지
+            않는 causal ordering을 지어내지 않는다.
+        timestamp:
+          type: string
+          format: date-time
+          description: timezone-aware UTC 시각.
+        run_id:
+          type: string
+        event:
+          $ref: "#/components/schemas/BuildEventName"
+        status:
+          $ref: "#/components/schemas/BuildEventStatus"
+        source_key:
+          type: [string, "null"]
+          description: 관련 소스 식별자. run 수준 event는 null.
+        stage:
+          oneOf:
+            - $ref: "#/components/schemas/BuildEventStageName"
+            - type: "null"
+          description: 관련 medallion stage. source fetch/run 수준 event는 null.
+        message:
+          type: [string, "null"]
+          description: 사람이 읽는 bounded, 안전한 요약. 없으면 null.
+        metrics:
+          type: [object, "null"]
+          description: >-
+            JSON 직렬화 가능한 안전한 수치 요약(예: records/row_count/
+            check_count). 원본 provider 응답이나 임의 object는 담지 않는다.
+          additionalProperties: true
+
+    BuildEventsResponse:
+      type: object
+      description: run identity와 chronological ascending으로 정렬된 event 목록.
+      required: [run_id, events]
+      properties:
+        run_id:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildEvent"
+
     StageStatusValue:
       type: string
       description: >-
@@ -2506,6 +3933,130 @@ components:
         not_run(상위 단계가 끝나지 못해 시도되지 않음) / unavailable(디렉터리는
         있지만 불완전·손상됨, legacy 형식 등)
       enum: [completed, failed, not_run, unavailable]
+
+    PublishTarget:
+      type: string
+      description: >-
+        HTTP publish API가 노출하는 target(#491). Local은 안전한 publish-root
+        계약이 없고, Kaggle은 정상 pipeline packaging의 metadata.id가 publish
+        destination과 정합하지 않아 이번 HTTP 계약에서 제외한다.
+      enum: [huggingface]
+
+    PublishIssue:
+      type: object
+      description: 안정적인 code + 사람이 읽는 message. UI가 문자열 파싱을 하지 않아도 된다.
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          description: >-
+            run_not_terminal / run_failed / run_cancelled / gold_unavailable /
+            artifact_missing / artifact_invalid / license_missing /
+            pii_allow_with_publish / credential_unavailable 중 하나(#491).
+            artifact_invalid는 canonical
+            manifest.outputs 항목이 gold root를 벗어나거나(symlink escape
+            포함) resolve할 수 없을 때 fail-closed로 반환된다.
+        message:
+          type: string
+
+    PublishReadinessResponse:
+      type: object
+      description: >-
+        side-effect-free readiness 판정. `ready`는 항상 `blockers`가 비어
+        있는지로 계산된다. `warnings`는 게시 자체를 막지 않는다.
+      required: [run_id, target, ready, blockers, warnings]
+      additionalProperties: false
+      properties:
+        run_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/PublishTarget"
+        ready:
+          type: boolean
+        blockers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublishIssue"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublishIssue"
+
+    PublishRequest:
+      type: object
+      description: >-
+        게시 요청. destination은 filesystem path로 해석되지 않고 target별
+        canonical identifier("owner/name")만 허용된다. options는 target이
+        실제로 지원하는 키만 허용하며(#491), 미지원 키는 조용히 무시되지 않고
+        400으로 거부된다.
+      required: [target, destination]
+      additionalProperties: false
+      properties:
+        target:
+          $ref: "#/components/schemas/PublishTarget"
+        destination:
+          type: string
+          description: "target별 owner/name 형태의 게시 대상 식별자."
+        options:
+          $ref: "#/components/schemas/PublishHuggingFaceOptions"
+
+    PublishHuggingFaceOptions:
+      type: object
+      description: >-
+        신규 Hugging Face dataset repo 생성 시 visibility. 기존 repo의
+        visibility는 변경하지 않는다. 생략 시 안전한 기본값 private=true다.
+      additionalProperties: false
+      properties:
+        private:
+          type: boolean
+          default: true
+
+    PublishResponse:
+      type: object
+      description: >-
+        기존 Publisher(PublishResult, publishers/base.py)의 결과를 그대로
+        노출한다. 서버 절대 경로는 담지 않는다 — reference는 안전한 외부
+        참조(URL 등)만 담는다.
+      required:
+        - run_id
+        - target
+        - publisher
+        - destination
+        - reference
+        - artifact_count
+        - status
+      additionalProperties: false
+      properties:
+        run_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/PublishTarget"
+        publisher:
+          type: string
+        destination:
+          type: string
+        reference:
+          type: string
+          description: 게시 위치에 대한 안전한 외부 참조(URL 등). 서버 내부 경로가 아니다.
+        artifact_count:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+
+    PublishBlockedResponse:
+      type: object
+      description: readiness 재검증에서 blocker가 발견되어 Publisher를 호출하지 않았음.
+      required: [error, blockers]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+        blockers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublishIssue"
 
     DatasetStageMap:
       type: object
@@ -2618,12 +4169,21 @@ components:
 
     DatasetsResponse:
       type: object
-      required: [datasets]
+      required: [datasets, total]
       properties:
         datasets:
           type: array
           items:
             $ref: "#/components/schemas/DatasetSummary"
+        total:
+          type: integer
+          minimum: 0
+          description: >-
+            canonical dataset grouping과 ownership/visibility 필터를 적용한 뒤,
+            pagination(limit)을 적용하기 전의 접근 가능한 distinct dataset_id
+            개수(#488 후속, additive). limit이 무한이면 `datasets` 길이와 같다.
+            `datasets` 길이·요청한 limit·기본 page 크기를 total로 사용하지 않는다.
+            다른 principal 소유 run만 있는 dataset은 포함되지 않는다.
 
     DatasetRunSummary:
       type: object
@@ -2874,3 +4434,220 @@ components:
         sample_available:
           type: boolean
           enum: [false]
+
+    # ---------------------------------------------------------------------
+    # Monitoring API (#516)
+    # ---------------------------------------------------------------------
+
+    MonitoringApiStatus:
+      type: object
+      description: >-
+        Builder API 요청 처리 latency 상태. availability=available은 latency
+        collector(ring buffer)가 정상적으로 표본을 읽어낼 수 있었다는 뜻이며,
+        collector 자체가 손상되어 표본을 읽을 수 없으면(#527) unavailable +
+        sample_count=null + p95_latency_ms=null이다 — "정상 무표본"
+        (available + sample_count=0 + p95_latency_ms=null)과 "측정 불가"를
+        같은 값으로 뭉개지 않는다. 이 subsystem 실패는 원 요청이나 이
+        monitoring 응답 자체를 실패시키지 않는다. Healthy/Degraded 같은
+        latency 임계값 판정은 근거(ADR/config)가 없어 이번 버전에서 발명하지
+        않는다 — raw sample_count/p95_latency_ms만 제공한다.
+      required: [availability, sample_count, p95_latency_ms]
+      additionalProperties: false
+      properties:
+        availability:
+          type: string
+          enum: [available, partial, unavailable]
+        sample_count:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            최근 최대 1000개 요청 ring buffer에 현재 보관된 표본 수.
+            availability가 unavailable이면(collector 실패) null.
+        p95_latency_ms:
+          type: [number, "null"]
+          description: >-
+            sample_count가 0이거나 availability가 unavailable이면 null.
+            nearest-rank 방식(보간 없음)으로 계산.
+
+    MonitoringQueueStatus:
+      type: object
+      description: >-
+        Async build queue 상태(#516). AsyncBuildExecutor/AsyncBuildJobRegistry
+        (#511/#513)의 read-only snapshot을 반영하며, 이 서비스는 항상
+        AsyncBuildExecutor를 생성하므로 정상 runtime에서는 항상
+        availability: available이다. waiting/running=0은 "대기/실행 중인 job이
+        실제로 없다"는 뜻이며, availability가 unavailable일 때만(예: async
+        build를 지원하지 않는 구성) 나머지 필드가 null이다 — "0건"과 "확인
+        불가"를 구분한다. total = waiting + running이며 terminal
+        (succeeded/failed/cancelled) job 이력은 포함하지 않는다.
+      required: [availability, waiting, running, total]
+      additionalProperties: false
+      properties:
+        availability:
+          type: string
+          enum: [available, partial, unavailable]
+        waiting:
+          type: [integer, "null"]
+          description: status=queued인 active job 수. unavailable이면 null.
+        running:
+          type: [integer, "null"]
+          description: status=running인 active job 수. unavailable이면 null.
+        total:
+          type: [integer, "null"]
+          description: waiting + running. unavailable이면 null.
+
+    MonitoringWorkerStatus:
+      type: object
+      description: >-
+        Async build worker pool 상태(#516). 근거는 MonitoringQueueStatus와
+        동일 — AsyncBuildExecutor가 항상 생성되므로 정상 runtime에서는 항상
+        availability: available이다. utilization은 0.0~1.0 ratio다(퍼센트
+        아님). unavailable일 때만 나머지 필드가 null이다.
+      required: [availability, active, capacity, utilization]
+      additionalProperties: false
+      properties:
+        availability:
+          type: string
+          enum: [available, partial, unavailable]
+        active:
+          type: [integer, "null"]
+          description: 현재 running job 수. unavailable이면 null.
+        capacity:
+          type: [integer, "null"]
+          description: >-
+            AsyncBuildExecutor 생성 시 지정한 max_workers. unavailable이면
+            null.
+        utilization:
+          type: [number, "null"]
+          description: >-
+            active / capacity ratio, 0.0~1.0. capacity가 0보다 클 때만 계산되며
+            unavailable이면 null(0.0으로 위장하지 않는다).
+
+    MonitoringArtifactStatus:
+      type: object
+      description: >-
+        Artifact Store 상태. output_root 폴더가 존재한다는 사실만으로
+        available로 간주하지 않는다 — BuildIndex 쿼리도 성공해야 available이다.
+        절대 파일시스템 경로는 노출하지 않는다.
+      required: [availability, last_write_at]
+      additionalProperties: false
+      properties:
+        availability:
+          type: string
+          enum: [available, partial, unavailable]
+        last_write_at:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            BuildIndex에 기록된 가장 최근 성공(ok) 빌드의 완료 시각. 성공 기록이
+            없으면 available이되 null(0건과 확인 불가를 구분).
+
+    MonitoringSummaryResponse:
+      type: object
+      description: >-
+        Studio Monitoring 화면용 시스템 상태 요약 (#516). Provider 상태는
+        요청마다 네트워크 프로브를 유발하므로(#492) 이번 버전에서는 포함하지
+        않는다.
+      required: [generated_at, status, api, queue, workers, artifact_store]
+      additionalProperties: false
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >-
+            required subsystem(api/queue/workers/artifact_store) availability로부터
+            계산되는 deterministic aggregate status. 넷 모두 available이면
+            healthy, 하나라도 partial/unavailable이면 degraded. latency
+            threshold(SLA)는 사용하지 않으며 sample_count=0/p95_latency_ms=null
+            자체는 degraded 근거가 아니다. Provider status(#492, optional)는
+            이 판정에 포함되지 않는다.
+        api:
+          $ref: "#/components/schemas/MonitoringApiStatus"
+        queue:
+          $ref: "#/components/schemas/MonitoringQueueStatus"
+        workers:
+          $ref: "#/components/schemas/MonitoringWorkerStatus"
+        artifact_store:
+          $ref: "#/components/schemas/MonitoringArtifactStatus"
+
+    MonitoringBuildBucket:
+      type: object
+      description: >-
+        [bucket_start, bucket_end) 반열린 구간의 build 카운트 (UTC). success는
+        내부 BuildIndex status "ok"를 외부 wire 명명으로 매핑한 값이다(#527) —
+        내부 BuildIndex status vocabulary(ok/failed/cancelled) 자체는 바뀌지
+        않는다.
+      required: [bucket_start, bucket_end, total, success, failed, cancelled]
+      additionalProperties: false
+      properties:
+        bucket_start:
+          type: string
+          format: date-time
+        bucket_end:
+          type: string
+          format: date-time
+        total:
+          type: integer
+          minimum: 0
+        success:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        cancelled:
+          type: integer
+          minimum: 0
+
+    MonitoringRecentRun:
+      type: object
+      description: Monitoring 화면용 최소 run 요약. dataset_id/owner_id/error 등은 노출하지 않는다.
+      required: [run_id, status, started_at, finished_at]
+      additionalProperties: false
+      properties:
+        run_id:
+          type: string
+        status:
+          type: string
+          enum: [ok, failed, cancelled]
+        started_at:
+          type: [string, "null"]
+        finished_at:
+          type: [string, "null"]
+
+    MonitoringBuildsResponse:
+      type: object
+      description: >-
+        window/bucket별 build 통계(#516). timezone은 UTC. bucket 기준
+        timestamp는 finished_at. excluded_count는 malformed timestamp로 집계에서
+        제외된 행 수이며, 0보다 크면 availability는 partial이다.
+      required: [window, bucket, availability, excluded_count, buckets, recent_runs]
+      additionalProperties: false
+      properties:
+        window:
+          type: string
+          enum: [24h]
+        bucket:
+          type: string
+          enum: [hour]
+        availability:
+          type: string
+          enum: [available, partial, unavailable]
+          description: >-
+            available: 집계 성공(0건이어도 유효). partial: BuildIndex 쿼리는
+            성공했지만 malformed timestamp로 일부 행이 제외됨. unavailable:
+            BuildIndex 쿼리 자체가 실패함(buckets는 빈 배열).
+        excluded_count:
+          type: integer
+          minimum: 0
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/MonitoringBuildBucket"
+        recent_runs:
+          type: array
+          items:
+            $ref: "#/components/schemas/MonitoringRecentRun"

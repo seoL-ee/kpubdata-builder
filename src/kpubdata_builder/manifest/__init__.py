@@ -7,10 +7,12 @@
     - FieldSummary / SchemaSummary / build_schema_summary: 스키마 요약 (#11)
     - SourceProvenance / build_source_provenance / compute_data_checksum: 상세 출처 (#12)
     - manifest_writer / write_manifest: 디스크 기록 함수
+    - status_from_manifest: 기록된 manifest에서 run 종단 상태를 읽는 단일 규칙 (#481)
 """
 
 from __future__ import annotations
 
+from .composition import CompositionProvenance
 from .environment import BuildEnvironment, capture_build_environment
 from .models import MANIFEST_SCHEMA_VERSION, BuildManifest
 from .provenance import (
@@ -20,12 +22,14 @@ from .provenance import (
     compute_inputs_fingerprint,
 )
 from .schema_summary import FieldSummary, SchemaSummary, build_schema_summary
+from .status import status_from_manifest
 from .writer import manifest_writer, write_manifest
 
 __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "BuildEnvironment",
     "BuildManifest",
+    "CompositionProvenance",
     "FieldSummary",
     "SchemaSummary",
     "SourceProvenance",
@@ -35,5 +39,6 @@ __all__ = [
     "compute_data_checksum",
     "compute_inputs_fingerprint",
     "manifest_writer",
+    "status_from_manifest",
     "write_manifest",
 ]

@@ -16,6 +16,11 @@ from ._types import RouteResponse
 if TYPE_CHECKING:
     from ..app import BuilderService
 
+# dataset을 메모리에 올린 뒤 slice하므로 limit 자체가 fetch량을 줄이지는 않지만,
+# 응답에 실리는 sample/diff 크기는 이 값으로 명확히 bound한다. 값은 stage
+# preview의 기존 상한(MAX_STAGE_PREVIEW_LIMIT, service/stages.py)과 맞췄다.
+MAX_PREVIEW_LIMIT = 1000
+
 
 def route(
     service: BuilderService,
@@ -41,8 +46,17 @@ def route(
         # 떨어뜨리지 않는다. 상한(MAX_PREVIEW_LIMIT) 초과는 service.preview()가 400으로 거부한다.
         if body is not None and "limit" in body:
             limit_value = body["limit"]
-            if not isinstance(limit_value, int) or isinstance(limit_value, bool) or limit_value < 1:
-                return ServiceResponse(400, {"error": "'limit' must be a positive integer"})
+            # bool은 int의 하위 타입이지만 limit 의미가 없으므로 거부.
+            if (
+                not isinstance(limit_value, int)
+                or isinstance(limit_value, bool)
+                or limit_value < 1
+                or limit_value > MAX_PREVIEW_LIMIT
+            ):
+                return ServiceResponse(
+                    400,
+                    {"error": f"'limit' must be a positive integer up to {MAX_PREVIEW_LIMIT}"},
+                )
             limit = limit_value
         else:
             limit = DEFAULT_PREVIEW_LIMIT

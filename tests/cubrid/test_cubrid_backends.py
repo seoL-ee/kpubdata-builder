@@ -1,4 +1,4 @@
-"""CUBRID 백엔드 계약/통합 테스트 (ADR 0013).
+"""CUBRID 백엔드 계약/통합 테스트 (ADR 0016).
 
 기본 스위트에서 제외된다(`-m 'not cubrid'`). 실행: ``pytest -m cubrid`` (sqlalchemy 필요).
 
@@ -42,8 +42,14 @@ def engine():  # type: ignore[no-untyped-def]
 def test_build_index_crud_and_ordering(engine) -> None:  # type: ignore[no-untyped-def]
     idx = CubridBuildIndex(engine)
     idx.insert_or_replace(
-        "cbx-1", "ok", "2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z",
-        spec_digest="d1", created_by="dev:local", dataset_id="cbx-ds", owner_id="oidc:a",
+        "cbx-1",
+        "ok",
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:01:00Z",
+        spec_digest="d1",
+        created_by="dev:local",
+        dataset_id="cbx-ds",
+        owner_id="oidc:a",
     )
     got = idx.get("cbx-1")
     assert got is not None and got.status == "ok" and got.dataset_id == "cbx-ds"
@@ -65,15 +71,52 @@ def test_build_index_crud_and_ordering(engine) -> None:  # type: ignore[no-untyp
 
 def test_build_index_rebuild(engine) -> None:  # type: ignore[no-untyped-def]
     idx = CubridBuildIndex(engine)
-    n = idx.rebuild([
-        BuildEntry("cbx-r1", "ok", "s", "f1", "dg", None, "dev:local", "cbx-ds2", "oidc:x"),
-        BuildEntry("cbx-r2", "failed", "s", "f2", None, "err", "dev:local", None, None),
-    ])
+    n = idx.rebuild(
+        [
+            BuildEntry("cbx-r1", "ok", "s", "f1", "dg", None, "dev:local", "cbx-ds2", "oidc:x"),
+            BuildEntry("cbx-r2", "failed", "s", "f2", None, "err", "dev:local", None, None),
+        ]
+    )
     assert n == 2
     got = idx.get("cbx-r1")
     assert got is not None and got.dataset_id == "cbx-ds2"
     # rebuild 는 truncate 하므로 이전 run 은 사라진다(정본 manifest 에서 재구축).
     assert idx.get("cbx-1") is None
+
+
+def test_build_index_monitoring_queries(engine) -> None:  # type: ignore[no-untyped-def]
+    """upstream monitoring(#516/#527) 메서드가 실 CUBRID 에서 동작하는지 검증."""
+    idx = CubridBuildIndex(engine)
+    idx.rebuild(
+        [
+            BuildEntry(
+                "cbm-1", "ok", "s", "2026-01-01T00:00:00Z", "d", None, "dev:local", "ds", "oidc:me"
+            ),
+            BuildEntry(
+                "cbm-2",
+                "failed",
+                "s",
+                "2026-01-02T00:00:00Z",
+                None,
+                "e",
+                "dev:local",
+                "ds",
+                "oidc:other",
+            ),
+            BuildEntry("cbm-3", "ok", "s", "2026-01-03T00:00:00Z", "d", None, "svc", "ds", None),
+        ]
+    )
+    # list_between: [start, end) 오름차순, end 이상은 제외
+    between = idx.list_between("2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z")
+    assert [e.run_id for e in between] == ["cbm-1", "cbm-2"]
+    # latest_successful_finished_at: 성공(ok) 중 최신
+    assert idx.latest_successful_finished_at() == "2026-01-03T00:00:00Z"
+    # list_recent_owned: owner_id 매치
+    owned = idx.list_recent_owned(limit=10, principal_owner_id="oidc:me", principal_label="oidc:x")
+    assert {e.run_id for e in owned} == {"cbm-1"}
+    # principal owner_id 없으면 created_by 폴백
+    owned2 = idx.list_recent_owned(limit=10, principal_owner_id=None, principal_label="svc")
+    assert {e.run_id for e in owned2} == {"cbm-3"}
 
 
 def test_build_index_write_failure_is_swallowed(engine) -> None:  # type: ignore[no-untyped-def]

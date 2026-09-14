@@ -1,6 +1,6 @@
 name: CUBRID integration
 
-# 실 CUBRID 서버 대상 백엔드 계약 테스트 (ADR 0013).
+# 실 CUBRID 서버 대상 백엔드 계약 테스트 (ADR 0016).
 #
 # 기본 CI(ci.yml)는 sqlite/local 만 검증한다. CUBRID dialect 의 실제 동작
 # (upsert/LOB/CLOB/DDL 타입매핑·LIMIT·트랜잭션)은 여기서 실 CUBRID 로 확인한다.

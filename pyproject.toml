@@ -27,10 +27,10 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  # Builder depends on the 0.5.x kpubdata API (Client.dataset(...).list, etc.).
-  # The old >=0.1.0a0 floor accepted any release and broke on clean installs that
-  # resolved an older kpubdata; pin to the 0.5 line until a compat policy lands (#213).
-  "kpubdata>=0.5.0,<0.6",
+  # Builder depends on the kpubdata Client API (Client.dataset(...).list, etc.).
+  # kpubdata 0.6.0 removed 141 retired datasets (breaking) — builder references
+  # none of them (verified 2026-09-09). Pin to the 0.6 line; compat policy: #213.
+  "kpubdata>=0.6.0,<0.7",
   "cryptography>=50,<51",
   "polars>=1.0,<2",
   "pyyaml>=6.0,<7",
@@ -67,6 +67,9 @@ dev = [
   "pytest-cov>=5,<8",
   "ruff>=0.5,<1",
   "types-PyYAML>=6.0",
+  # Windows에서 zoneinfo가 시스템 tz 데이터베이스를 찾지 못하는 경우를
+  # 대비해 tzdata wheel을 보장한다(#553). Linux에서는 no-op다.
+  "tzdata>=2024.1",
   # auth extra를 dev에 포함해 CI(mypy/ruff/pytest)에서 항상 타입 체크 가능 (#385).
   "pyjwt[crypto]>=2.9,<3",
   # CUBRID 백엔드 타입체크/스모크용. 드라이버가 Python 3.12+ 를 요구하므로 환경

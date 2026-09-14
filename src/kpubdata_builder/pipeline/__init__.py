@@ -11,12 +11,14 @@ Bronze → Silver → Gold → (Export) → Manifest 흐름을 묶는 orchestrat
     - PreviewResult / SourcePreview: 미리보기 결과 모델
     - PreviewDiffItem / PreviewTransformSummary / SampleMode: Source↔Silver diff·sampling
       결과 모델 (#497)
+    - CancellationProbe: 협력적 취소 probe 계약 (#481)
 """
 
 from __future__ import annotations
 
+from .cancellation import CancellationProbe
 from .context import BuildContext
-from .orchestrator import BuildResult, SourceBuildOutcome, run_build
+from .orchestrator import BuildResult, CompositionOutcome, SourceBuildOutcome, run_build
 from .preview import (
     DEFAULT_PREVIEW_SEED,
     MAX_PREVIEW_DIFF_ITEMS,
@@ -33,6 +35,8 @@ __all__ = [
     "MAX_PREVIEW_DIFF_ITEMS",
     "BuildContext",
     "BuildResult",
+    "CancellationProbe",
+    "CompositionOutcome",
     "PreviewDiffItem",
     "PreviewResult",
     "PreviewTransformSummary",

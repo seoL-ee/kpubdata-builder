@@ -1,4 +1,4 @@
-"""CUBRID 기반 암호화 Provider credential 저장소 (ADR 0013).
+"""CUBRID 기반 암호화 Provider credential 저장소 (ADR 0016).
 
 ``SQLiteCredentialRepository`` 와 동일한 ``CredentialRepository`` Protocol 을 SQLAlchemy
 Core 로 구현한다. **ciphertext 만** 저장하며, AES-GCM AAD(``associated_data``)와 owner
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 
 class CubridCredentialRepository:
-    """ciphertext 만 CUBRID 에 기록하는 credential repository (ADR 0013)."""
+    """ciphertext 만 CUBRID 에 기록하는 credential repository (ADR 0016)."""
 
     def __init__(self, engine: Engine, cipher: CredentialCipher) -> None:
         self._engine = engine
@@ -83,9 +83,7 @@ class CubridCredentialRepository:
         if row is None:
             return None
         ciphertext = base64.b64decode(row[0])
-        return self._cipher.decrypt(
-            ciphertext, associated_data=associated_data(owner_id, provider)
-        )
+        return self._cipher.decrypt(ciphertext, associated_data=associated_data(owner_id, provider))
 
     def list_configured_providers(self, owner_id: str) -> Sequence[str]:
         validate_owner_id(owner_id)

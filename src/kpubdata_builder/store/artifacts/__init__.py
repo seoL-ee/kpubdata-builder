@@ -1,4 +1,4 @@
-"""산출물/manifest 저장소 추상화 (ADR 0010/0013).
+"""산출물/manifest 저장소 추상화 (ADR 0010/0016).
 
 ``ArtifactStore`` Protocol 과 기본 구현체 ``LocalArtifactStore``(무외부의존)를 노출하고,
 ``make_artifact_store()`` 팩토리가 ``KPUBDATA_BUILDER_STORAGE_BACKEND`` 에 따라 sqlite/local
@@ -14,7 +14,7 @@ from .protocol import ArtifactStore
 
 
 def make_artifact_store(output_root: Path) -> ArtifactStore:
-    """선택된 백엔드에 맞는 ``ArtifactStore`` 를 생성한다 (ADR 0013)."""
+    """선택된 백엔드에 맞는 ``ArtifactStore`` 를 생성한다 (ADR 0016)."""
     from ..backend import storage_backend
 
     if storage_backend() == "cubrid":

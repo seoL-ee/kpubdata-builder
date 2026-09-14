@@ -1,4 +1,4 @@
-"""CUBRID 기반 빌드 인덱스 (ADR 0013).
+"""CUBRID 기반 빌드 인덱스 (ADR 0016).
 
 ``SqliteBuildIndex`` 와 동일한 ``BuildIndex`` Protocol 을 SQLAlchemy Core 로 구현한다
 (ORM 아님 — 기존 raw-SQL 스타일 유지). manifest.json 정본 원칙과 SCHEMA_VERSION,
@@ -27,9 +27,11 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    and_,
     delete,
     insert,
     inspect,
+    or_,
     select,
 )
 
@@ -43,7 +45,7 @@ _SCHEMA_VERSION_TABLE = "build_schema_version"
 
 
 class CubridBuildIndex:
-    """CUBRID 기반 빌드 인덱스 (ADR 0013). ``BuildIndex`` Protocol 구현체."""
+    """CUBRID 기반 빌드 인덱스 (ADR 0016). ``BuildIndex`` Protocol 구현체."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -156,6 +158,54 @@ class CubridBuildIndex:
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).all()
         return [self._row_to_entry(r) for r in rows]
+
+    def list_recent_owned(
+        self, *, limit: int, principal_owner_id: str | None, principal_label: str
+    ) -> list[BuildEntry]:
+        # ownership 필터를 LIMIT 보다 먼저 WHERE 로 적용한다(#527) — service.auth.
+        # principal_owns()와 동일 정책. NULL 비교는 자연히 fail-closed.
+        b = self._builds.c
+        if principal_owner_id is not None:
+            cond = or_(
+                and_(b.owner_id.is_not(None), b.owner_id == principal_owner_id),
+                and_(b.owner_id.is_(None), b.created_by == principal_label),
+            )
+        else:
+            cond = b.created_by == principal_label
+        stmt = select(self._builds).where(cond).order_by(b.finished_at.desc()).limit(limit)
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+        return [self._row_to_entry(r) for r in rows]
+
+    def list_between(self, start_iso: str, end_iso: str) -> list[BuildEntry]:
+        # [start, end) 구간 + finished_at NULL(판정 불가 → 호출자에게 넘김, #516).
+        b = self._builds.c
+        stmt = (
+            select(self._builds)
+            .where(
+                or_(
+                    b.finished_at.is_(None),
+                    and_(b.finished_at >= start_iso, b.finished_at < end_iso),
+                )
+            )
+            .order_by(b.finished_at.asc())
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+        return [self._row_to_entry(r) for r in rows]
+
+    def latest_successful_finished_at(self) -> str | None:
+        # 가장 최근 성공 빌드의 finished_at (#516). 성공 기록 없으면 None.
+        b = self._builds.c
+        stmt = (
+            select(b.finished_at)
+            .where(and_(b.status == "ok", b.finished_at.is_not(None)))
+            .order_by(b.finished_at.desc())
+            .limit(1)
+        )
+        with self._engine.connect() as conn:
+            row = conn.execute(stmt).first()
+        return str(row[0]) if row is not None else None
 
     def get(self, run_id: str) -> BuildEntry | None:
         stmt = select(self._builds).where(self._builds.c.run_id == run_id)

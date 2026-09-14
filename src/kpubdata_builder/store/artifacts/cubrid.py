@@ -1,4 +1,4 @@
-"""CubridArtifactStore — manifest 문서를 CUBRID 정본으로 두는 저장소 (ADR 0013).
+"""CubridArtifactStore — manifest 문서를 CUBRID 정본으로 두는 저장소 (ADR 0016).
 
 산출물 바이트와 run 워크스페이스는 ``LocalArtifactStore`` 에 위임한다(FS/블록 볼륨).
 manifest 문서만 CUBRID ``manifests`` 행을 정본으로 삼고 FS 는 미러(캐시)로 유지한다 —
@@ -66,9 +66,7 @@ class CubridArtifactStore:
         with self._engine.begin() as conn:
             conn.execute(delete(self._table).where(self._table.c.run_id == run_id))
             conn.execute(
-                insert(self._table).values(
-                    run_id=run_id, manifest=payload, updated_at=updated_at
-                )
+                insert(self._table).values(run_id=run_id, manifest=payload, updated_at=updated_at)
             )
         # FS 미러 유지(벌크 스캔·바이트 colocate·백업). CUBRID 기록이 성공한 뒤에만 미러.
         self._local.put_manifest(run_id, manifest)

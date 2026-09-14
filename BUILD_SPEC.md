@@ -50,6 +50,7 @@ exports:
 | `pii` | object | PII 검출 정책 |
 | `license` | string | 데이터셋 라이선스 또는 이용허락 범위 |
 | `quality` | object | Silver 통계 기반 품질 임계 정책 |
+| `composition` | object | 두 source를 join해 하나의 결합 Gold dataset을 추가로 만드는 계약 (#506) |
 
 ## 4. 필드 상세
 
@@ -73,7 +74,19 @@ exports:
 
 ### 4.4 `sources` (배열)
 
-각 소스는 다음 필드를 가집니다.
+`kind` 필드로 세 종류의 source를 표현합니다(#498). `kind`를 생략하면 항상
+`public_api`로 해석되므로 기존 BuildSpec은 수정 없이 그대로 동작합니다.
+
+| kind | 의미 |
+| :--- | :--- |
+| `public_api` (기본) | 기존 kpubdata provider/dataset 참조 |
+| `file` | `POST /uploads`로 사전 업로드한 파일(CSV/JSON/JSONL/Parquet) 참조 |
+| `url` | 안전한 GET(Auth=None) HTTP(S) 소스 |
+
+`alias`/`schema`는 세 kind 공통 필드입니다. 그 외 필드는 kind별로 서로
+배타적이며, 다른 kind의 필드가 섞이면 BuildSpec 로드 시 즉시 거부됩니다.
+
+#### `kind: public_api` (기본값)
 
 ```yaml
 sources:
@@ -96,11 +109,71 @@ sources:
 
 | 필드 | 타입 | 필수 | 설명 |
 | :--- | :--- | :--- | :--- |
+| `kind` | string | 아니오 | 생략 시 `public_api` |
 | `provider` | string | 예 | `kpubdata` provider 이름 |
 | `dataset` | string | 예 | provider 내부 dataset 이름 |
 | `params` | object | 아니오 | source 호출 파라미터 (JSON 호환 값) |
 | `alias` | string | 아니오 | 조립 단계에서 사용할 사용자 정의 소스 이름 |
 | `schema` | object | 아니오 | Silver 정규화 및 required-column/dtype 검증 계약 |
+
+#### `kind: file` (#498)
+
+`POST /uploads`가 발급한 `upload_id`를 참조합니다. 파일시스템 경로를 직접
+쓸 수 없습니다 — `upload_id`는 서버가 발급한 불투명한 식별자(`upl_<hex32>`)이며,
+업로드 자체는 principal의 owner_id로 격리됩니다(다른 사용자의 upload_id를
+참조할 수 없음). `format`/`encoding`은 업로드 시점에 검증된 값과 정확히
+일치해야 합니다.
+
+```yaml
+sources:
+  - kind: file
+    upload_id: upl_0123456789abcdef0123456789abcdef
+    format: csv
+    encoding: utf-8
+    alias: uploaded_trades
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+| :--- | :--- | :--- | :--- |
+| `kind` | string | 예 | `file` |
+| `upload_id` | string | 예 | `POST /uploads` 응답의 `upload_id` |
+| `format` | string | 예 | `csv` \| `json` \| `jsonl` \| `parquet` (업로드 시 검증된 값과 일치해야 함) |
+| `encoding` | string | 아니오 | 텍스트 포맷(csv/json/jsonl) 디코딩 인코딩. 기본값 `utf-8`. parquet은 무시됨 |
+| `alias` | string | 아니오 | 조립 단계에서 사용할 사용자 정의 소스 이름 |
+| `schema` | object | 아니오 | Silver 정규화 및 required-column/dtype 검증 계약 |
+
+지원 포맷은 CSV/JSON(top-level array of objects)/JSONL/Parquet입니다.
+Excel/ZIP은 범위 밖입니다.
+
+#### `kind: url` (#498 P0)
+
+GET, Auth=None인 안전한 HTTP(S) 소스만 P0 범위입니다. Bearer credential
+연동은 #492 이후 P1 확장입니다.
+
+```yaml
+sources:
+  - kind: url
+    endpoint: https://example.org/data.json
+    method: GET
+    alias: external_feed
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+| :--- | :--- | :--- | :--- |
+| `kind` | string | 예 | `url` |
+| `endpoint` | string | 예 | fetch할 절대 URL. `https`만 허용하며 userinfo(`user:pass@host`)는 금지 |
+| `method` | string | 아니오 | 기본값 `GET`. P0는 `GET`만 허용 |
+| `format` | string | 아니오 | `json` \| `jsonl` \| `csv`. 생략 시 응답 `Content-Type`으로 추론(기본 `json`) |
+| `alias` | string | 아니오 | 조립 단계에서 사용할 사용자 정의 소스 이름 |
+| `schema` | object | 아니오 | Silver 정규화 및 required-column/dtype 검증 계약 |
+
+**SSRF 방어(#498)**: `https` 외 scheme(`http`/`file`/`ftp` 등) 거부, userinfo
+포함 URL 거부, hostname을 DNS로 직접 resolve해 loopback/private/link-local/
+reserved 등 비공인(non-global) 주소로의 fetch 거부(하나라도 비공인이면 전체
+거부), 실제 TCP 연결은 검증된 IP에 직접 연결(DNS rebinding 방지), redirect마다
+동일 검증 반복(최대 5회), connect/read timeout과 응답 크기 상한 적용. 임의
+header나 POST/PUT/PATCH는 계약에 필드 자체가 없어 표현할 수 없습니다.
+provenance/manifest에는 query string이 제거된 endpoint만 남습니다.
 
 `schema`는 다음 선택 필드를 지원합니다.
 
@@ -334,6 +407,76 @@ WARN/FAIL 결과를 남기며, WARN은 Build를 계속하고 FAIL은 Gold 진입
 컬럼이 없어 dtype을 검사할 수 없는 경우 dtype PASS를 만들지 않습니다 — "required
 FAIL + dtype PASS" 같은 모순을 피합니다. Schema 위반은 severity 설정과 무관하게
 항상 hard failure입니다(#189의 기존 게이트 그대로).
+
+### 4.12 `composition` (optional)
+
+두 source의 검증된 Silver 테이블을 join해 하나의 결합 Gold dataset을
+추가로 만드는 계약입니다(#506). `composition` 없는 기존 multi-source
+BuildSpec은 그대로 동작합니다 — source별 독립 Gold가 회귀 없이 유지되고,
+composition은 부가 산출물로 `gold/{composition.name}/`에 추가됩니다.
+
+초기 범위는 **두 source, 단일 equi-join**으로 제한합니다. 자유형 SQL
+transformation과 3개 이상의 join graph는 지원하지 않습니다.
+
+```yaml
+sources:
+  - provider: datago
+    dataset: apt_trade
+    alias: sales
+  - provider: datago
+    dataset: region_meta
+    alias: region
+
+composition:
+  name: sales_with_region
+  join:
+    left: sales
+    right: region
+    left_key: region_id
+    right_key: id
+    type: inner
+    on_duplicate_key: warn
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+| :--- | :--- | :--- | :--- |
+| `name` | string | 예 | 결합 결과 Gold dataset 이름. 다른 source의 output key(alias 또는 `provider.dataset`)와 겹칠 수 없습니다. |
+| `join` | object | 예 | 아래 join 계약 |
+| `join.left` | string | 예 | 왼쪽 source의 alias (`sources[].alias` 참조) |
+| `join.right` | string | 예 | 오른쪽 source의 alias |
+| `join.left_key` | string | 예 | 왼쪽 테이블의 join key 컬럼명 |
+| `join.right_key` | string | 예 | 오른쪽 테이블의 join key 컬럼명 |
+| `join.type` | string | 아니오 | `inner`(기본) \| `left` |
+| `join.on_duplicate_key` | string | 아니오 | `warn`(기본) \| `fail` |
+
+**alias 필수/중복 규칙**: `composition.join.left`/`right`가 참조하는 두
+source는 반드시 비어 있지 않은 `alias`를 선언해야 하며, `composition`을
+쓰는 BuildSpec에서는 선언된 모든 `sources[].alias` 값이 서로 달라야
+합니다(빈 alias는 이 유일성 검사 대상이 아닙니다). 이 규칙은 `composition`이
+없는 BuildSpec에는 적용되지 않습니다.
+
+**join key 검증 시점**: alias 참조·`type`/`on_duplicate_key` 어휘 같은
+구조적 문제는 `validate_spec`(구조 검증)이 스펙 파싱 직후 잡습니다. 하지만
+join key 컬럼의 **존재 여부와 dtype 호환성**은 두 source가 각각 Silver
+단계를 통과해야만 알 수 있으므로, 여기서는 검증할 수 없고 빌드 파이프라인의
+런타임 게이트(orchestrator, Silver 완료 직후)에서 확인해 실패시킵니다. dtype은
+완전히 동일해야 join이 허용됩니다 — 자동 캐스팅은 하지 않으며, 타입을
+맞추려면 `sources[].schema.casts`(§4.4, #437)로 Silver 단계에서 명시적으로
+정규화하세요.
+
+**duplicate-key row explosion guard**: 두 source가 동일 값으로 join key가
+모두 중복이면(many-to-many) 결과 행이 곱셈으로 폭증할 수 있습니다. 기본값
+`on_duplicate_key: warn`은 결과를 만들고 manifest에 경고와 함께 정확한 행 수/
+distinct key 수를 남기며, `fail`은 Gold 진입 전에 composition을 실패 처리합니다.
+
+**참조된 source가 실패한 경우**: `composition.join`이 참조하는 source 중
+하나라도 Bronze/Silver를 통과하지 못하면 join을 시도하지 않고
+`skipped`로 기록합니다(다른 source의 독립 Gold는 영향받지 않습니다).
+
+**provenance**: manifest의 `composition` 필드(`CompositionProvenance`)에
+join 조건(source/key/type)과 좌우 원본 행 수·distinct key 수·결과 행 수가
+그대로 기록되어 추적 가능합니다. `POST /build` 응답에도 `outcomes`(소스별)와
+별도로 `composition`(결합 결과) 키가 노출됩니다.
 
 ## 5. 검증 규칙
 

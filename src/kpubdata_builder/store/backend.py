@@ -1,4 +1,4 @@
-"""상태 백엔드 선택 (ADR 0013).
+"""상태 백엔드 선택 (ADR 0016).
 
 기본은 sqlite/local FS 다(무외부의존·결정성, AGENTS.md). 환경변수
 ``KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid`` 이면 CUBRID(SQLAlchemy)로 전환한다.
@@ -70,7 +70,7 @@ def get_engine() -> Engine:
 
 
 def validate_storage_config() -> None:
-    """serve 시작 시 호출 (fail-fast, ADR 0013).
+    """serve 시작 시 호출 (fail-fast, ADR 0016).
 
     - sqlite 백엔드 → no-op.
     - cubrid 백엔드 → URL 미설정이거나 ``sqlalchemy-cubrid`` 미설치면 기동 거부.

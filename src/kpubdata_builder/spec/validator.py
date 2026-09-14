@@ -13,13 +13,23 @@ BL3 (#417): problems를 {code, path, message, hint} 객체 배열로 구조화.
 
 from __future__ import annotations
 
+import codecs
 import math
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from ..errors import ValidationError
 from ..exporters import EXPORTER_REGISTRY
 from ..tabular.polars_helpers import _NAMED_DTYPES
-from .models import BuildSpec
+from .models import (
+    SOURCE_FILE_FORMATS,
+    SOURCE_KINDS,
+    SOURCE_URL_FORMATS,
+    SOURCE_URL_METHODS,
+    UPLOAD_ID_PATTERN,
+    BuildSpec,
+    SourceRef,
+)
 
 
 @dataclass(frozen=True)
@@ -61,22 +71,25 @@ def validate_spec(spec: BuildSpec) -> None:
     if not spec.sources:
         problems.append(_p("missing_sources", "sources", "at least one source is required"))
     for i, source in enumerate(spec.sources):
-        if not source.provider.strip():
-            problems.append(
-                _p(
-                    "empty_field",
-                    f"sources[{i}].provider",
-                    f"sources[{i}].provider must be a non-empty string",
+        # provider/dataset은 kind="public_api"(기본값)에서만 의미가 있다 — 다른
+        # kind의 필수/금지 field는 _source_kind_problems가 검증한다 (#498).
+        if source.kind == "public_api":
+            if not source.provider.strip():
+                problems.append(
+                    _p(
+                        "empty_field",
+                        f"sources[{i}].provider",
+                        f"sources[{i}].provider must be a non-empty string",
+                    )
                 )
-            )
-        if not source.dataset.strip():
-            problems.append(
-                _p(
-                    "empty_field",
-                    f"sources[{i}].dataset",
-                    f"sources[{i}].dataset must be a non-empty string",
+            if not source.dataset.strip():
+                problems.append(
+                    _p(
+                        "empty_field",
+                        f"sources[{i}].dataset",
+                        f"sources[{i}].dataset must be a non-empty string",
+                    )
                 )
-            )
         if source.alias and not source.alias.strip():
             problems.append(
                 _p(
@@ -115,9 +128,11 @@ def validate_spec(spec: BuildSpec) -> None:
             break
     problems.extend(_split_problems(spec))
     problems.extend(_schema_problems(spec))
+    problems.extend(_source_kind_problems(spec))
     problems.extend(_pii_problems(spec))
     problems.extend(_license_problems(spec))
     problems.extend(_quality_problems(spec))
+    problems.extend(_composition_problems(spec))
     if problems:
         raise ValidationError([str(p) for p in problems], structured=problems)
 
@@ -246,6 +261,132 @@ def _schema_problems(spec: BuildSpec) -> list[ValidationProblem]:
     return problems
 
 
+def _source_kind_problems(spec: BuildSpec) -> list[ValidationProblem]:
+    """kind vocabulary와 kind='file'/'url' source의 값·SSRF 관련 형태를 검증한다 (#498).
+
+    ``kind`` 자체가 ``SOURCE_KINDS``(public_api/file/url) 밖이면 여기서
+    거부한다 — loader(YAML 경로)는 이미 거부하지만, ``SourceRef(kind="ftp",
+    ...)``처럼 loader를 거치지 않고 BuildSpec을 직접 구성하면 이 검사가 유일한
+    방어선이다(fail-closed, #538 review). canonical source kind 계약은
+    public_api | file | url 세 가지뿐이며, 알 수 없는 kind를 암묵적으로
+    public_api처럼 처리하지 않는다.
+
+    나머지는 loader가 검사하지 않는 의미 규칙(허용 format/encoding/method
+    vocabulary, URL scheme/userinfo, upload_id 형태)만 다룬다. 실제 네트워크
+    SSRF 방어(DNS resolve·redirect 재검증)는 fetch 시점(ingestion.url_fetch)의
+    책임이다 — 여기서는 명백히 안전하지 않은 선언(scheme=http, userinfo 포함
+    등)을 build 실행 전에 빠르게 거부한다.
+    """
+    problems: list[ValidationProblem] = []
+    for i, source in enumerate(spec.sources):
+        prefix = f"sources[{i}]"
+        if source.kind not in SOURCE_KINDS:
+            problems.append(
+                _p(
+                    "unsupported_source_kind",
+                    f"{prefix}.kind",
+                    f"{prefix}.kind {source.kind!r} is not supported; "
+                    f"use one of {SOURCE_KINDS} (#498)",
+                )
+            )
+        elif source.kind == "file":
+            problems.extend(_file_source_problems(source, prefix))
+        elif source.kind == "url":
+            problems.extend(_url_source_problems(source, prefix))
+    return problems
+
+
+def _file_source_problems(source: SourceRef, prefix: str) -> list[ValidationProblem]:
+    problems: list[ValidationProblem] = []
+    if not source.upload_id.strip():
+        problems.append(
+            _p(
+                "empty_field",
+                f"{prefix}.upload_id",
+                f"{prefix}.upload_id must be a non-empty string",
+            )
+        )
+    elif not UPLOAD_ID_PATTERN.match(source.upload_id):
+        problems.append(
+            _p(
+                "invalid_upload_id",
+                f"{prefix}.upload_id",
+                f"{prefix}.upload_id {source.upload_id!r} is not a valid upload identifier",
+                hint="upload_id must come from POST /uploads",
+            )
+        )
+    if source.format not in SOURCE_FILE_FORMATS:
+        problems.append(
+            _p(
+                "unsupported_source_format",
+                f"{prefix}.format",
+                f"{prefix}.format {source.format!r} is not supported for kind='file'",
+                hint=f"Use one of: {', '.join(SOURCE_FILE_FORMATS)}",
+            )
+        )
+    try:
+        codecs.lookup(source.encoding)
+    except LookupError:
+        problems.append(
+            _p(
+                "unknown_encoding",
+                f"{prefix}.encoding",
+                f"{prefix}.encoding {source.encoding!r} is not a known encoding",
+            )
+        )
+    return problems
+
+
+def _url_source_problems(source: SourceRef, prefix: str) -> list[ValidationProblem]:
+    problems: list[ValidationProblem] = []
+    if source.method not in SOURCE_URL_METHODS:
+        problems.append(
+            _p(
+                "unsupported_source_method",
+                f"{prefix}.method",
+                f"{prefix}.method {source.method!r} is not supported (P0 supports GET only, #498)",
+                hint=f"Use one of: {', '.join(SOURCE_URL_METHODS)}",
+            )
+        )
+    if source.format and source.format not in SOURCE_URL_FORMATS:
+        problems.append(
+            _p(
+                "unsupported_source_format",
+                f"{prefix}.format",
+                f"{prefix}.format {source.format!r} is not supported for kind='url'",
+                hint=f"Use one of: {', '.join(SOURCE_URL_FORMATS)}",
+            )
+        )
+    problems.extend(_endpoint_problems(source.endpoint, f"{prefix}.endpoint"))
+    return problems
+
+
+def _endpoint_problems(endpoint: str, path: str) -> list[ValidationProblem]:
+    if not endpoint.strip():
+        return [_p("empty_field", path, f"{path} must be a non-empty string")]
+    parsed = urlsplit(endpoint)
+    problems: list[ValidationProblem] = []
+    if parsed.scheme != "https":
+        problems.append(
+            _p(
+                "unsafe_url_scheme",
+                path,
+                f"{path} must use https (got {parsed.scheme or 'none'!r}) — SSRF policy, #498",
+            )
+        )
+    if parsed.username or parsed.password:
+        problems.append(
+            _p(
+                "url_userinfo_forbidden",
+                path,
+                f"{path} must not contain userinfo (SSRF policy, #498)",
+            )
+        )
+    if not parsed.hostname:
+        problems.append(_p("missing_url_host", path, f"{path} must include a host"))
+    return problems
+
+
 def _pii_problems(spec: BuildSpec) -> list[ValidationProblem]:
     """PII 정책의 명백한 위반을 사전에 검증한다 (#441).
 
@@ -326,6 +467,102 @@ def _license_problems(spec: BuildSpec) -> list[ValidationProblem]:
                 "license is required when publish=true (재배포 가능성 명시, #443)",
             )
         )
+    return problems
+
+
+def _composition_problems(spec: BuildSpec) -> list[ValidationProblem]:
+    """composition의 alias 참조/구조적 일관성을 검증한다 (#506).
+
+    composition이 None이면 아무 것도 검사하지 않는다 — composition 없는 기존
+    multi-source BuildSpec은 이 검증의 영향을 받지 않는다. join key 존재 여부와
+    dtype 호환성은 Silver 스키마가 나와야 알 수 있으므로(파싱/구조 검증 시점엔
+    미지) 여기서 다루지 않는다 — orchestrator의 빌드 파이프라인 검증 게이트가
+    런타임에 담당한다.
+    """
+    problems: list[ValidationProblem] = []
+    composition = spec.composition
+    if composition is None:
+        return problems
+
+    if not composition.name.strip():
+        problems.append(
+            _p("empty_field", "composition.name", "composition.name must be a non-empty string")
+        )
+    else:
+        existing_output_keys = {
+            source.alias if source.alias else f"{source.provider}.{source.dataset}"
+            for source in spec.sources
+        }
+        if composition.name in existing_output_keys:
+            problems.append(
+                _p(
+                    "composition_name_collision",
+                    "composition.name",
+                    f"composition.name {composition.name!r} collides with an existing source "
+                    "output key (alias or provider.dataset)",
+                )
+            )
+
+    join = composition.join
+    aliases = [source.alias for source in spec.sources if source.alias]
+    duplicate_aliases = sorted({a for a in aliases if aliases.count(a) > 1})
+    if duplicate_aliases:
+        problems.append(
+            _p(
+                "duplicate_source_alias",
+                "sources",
+                "sources[].alias must be unique when composition is used; "
+                f"duplicates: {duplicate_aliases}",
+            )
+        )
+
+    if join.left and join.left == join.right:
+        problems.append(
+            _p(
+                "self_join",
+                "composition.join",
+                "composition.join.left and right must reference different sources, "
+                f"both are {join.left!r}",
+            )
+        )
+
+    for side_name, alias in (("left", join.left), ("right", join.right)):
+        if not alias.strip():
+            problems.append(
+                _p(
+                    "empty_field",
+                    f"composition.join.{side_name}",
+                    f"composition.join.{side_name} must be a non-empty string",
+                )
+            )
+            continue
+        if not any(source.alias == alias for source in spec.sources):
+            problems.append(
+                _p(
+                    "unknown_composition_source",
+                    f"composition.join.{side_name}",
+                    f"composition.join.{side_name} {alias!r} does not match any sources[].alias "
+                    "(a source referenced by composition must declare a non-empty alias)",
+                )
+            )
+
+    if not join.left_key.strip():
+        problems.append(
+            _p(
+                "empty_field",
+                "composition.join.left_key",
+                "composition.join.left_key must be a non-empty string",
+            )
+        )
+    if not join.right_key.strip():
+        problems.append(
+            _p(
+                "empty_field",
+                "composition.join.right_key",
+                "composition.join.right_key must be a non-empty string",
+            )
+        )
+
     return problems
 
 

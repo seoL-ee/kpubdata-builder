@@ -1,4 +1,4 @@
-# ADR 0013 — CUBRID 상태 백엔드 + manifest 정본 이전
+# ADR 0016 — CUBRID 상태 백엔드 + manifest 정본 이전
 
 - 상태: 수용됨(Accepted)
 - 관련 이슈/문서: [ADR 0003](./0003-persistent-build-store.md)(영속 Build 저장소), [ADR 0010](./0010-artifactstore-state-backend.md)(ArtifactStore·백엔드 분리, 제안됨), [ADR 0012](./0012-provider-credential-boundary.md)(credential 경계)
