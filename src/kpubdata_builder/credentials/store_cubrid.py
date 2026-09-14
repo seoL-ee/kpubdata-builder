@@ -15,16 +15,17 @@ credential 쓰기는 사용자 액션이므로 (파생 인덱스와 달리) 예�
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Column,
-    LargeBinary,
     MetaData,
     String,
     Table,
+    Text,
     delete,
     insert,
     select,
@@ -50,10 +51,11 @@ class CubridCredentialRepository:
             self._metadata,
             Column("owner_id", String(255), primary_key=True),
             Column("provider", String(64), primary_key=True),
-            # CUBRID 는 BLOB 컬럼에 NOT NULL 제약을 허용하지 않는다(errno -1014). 따라서
-            # nullable 로 두고, 애플리케이션이 항상 ciphertext 를 기록/검증한다(put 은
-            # 비어있지 않은 credential 만 받고 encrypt 결과를 저장, get_secret 은 None 처리).
-            Column("ciphertext", LargeBinary),
+            # ciphertext 는 base64 텍스트(CLOB)로 저장한다. CUBRID 는 BLOB 에 NOT NULL 을
+            # 허용하지 않고(errno -1014), pycubrid 의 BLOB 바이너리 왕복이 str 로 돌아와
+            # 깨지므로, base64 문자열로 저장해 결정적 왕복 + NOT NULL 을 확보한다. SQLite
+            # 구현은 raw BLOB 을 쓰지만, Protocol 뒤라 저장 표현은 백엔드마다 달라도 된다.
+            Column("ciphertext", Text, nullable=False),
             Column("updated_at", String(40), nullable=False),
         )
         self._table.create(self._engine, checkfirst=True)
@@ -80,8 +82,9 @@ class CubridCredentialRepository:
             row = conn.execute(stmt).first()
         if row is None:
             return None
+        ciphertext = base64.b64decode(row[0])
         return self._cipher.decrypt(
-            bytes(row[0]), associated_data=associated_data(owner_id, provider)
+            ciphertext, associated_data=associated_data(owner_id, provider)
         )
 
     def list_configured_providers(self, owner_id: str) -> Sequence[str]:
@@ -104,6 +107,7 @@ class CubridCredentialRepository:
         ciphertext = self._cipher.encrypt(
             credential, associated_data=associated_data(owner_id, provider)
         )
+        ciphertext_b64 = base64.b64encode(ciphertext).decode("ascii")
         # 단일 트랜잭션 내 delete+insert — dialect upsert 에 의존하지 않는다.
         with self._engine.begin() as conn:
             conn.execute(
@@ -115,7 +119,7 @@ class CubridCredentialRepository:
                 insert(self._table).values(
                     owner_id=owner_id,
                     provider=provider,
-                    ciphertext=ciphertext,
+                    ciphertext=ciphertext_b64,
                     updated_at=updated_at,
                 )
             )
