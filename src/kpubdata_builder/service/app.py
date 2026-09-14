@@ -50,6 +50,7 @@ from ..spec.validator import validate_spec
 from ..stages._path_safety import ensure_within, validate_path_segment
 from ..stages.bronze.build import SourceClient
 from ..store import make_build_index
+from ..store.backend import storage_backend
 from ..tabular import DEFAULT_PREVIEW_LIMIT
 from . import datasets as datasets_service
 from . import ownership as ownership_module
@@ -94,11 +95,20 @@ def _close_request_client(client: SourceClient) -> None:
 
 
 def _credential_repository_from_env(output_root: Path) -> CredentialRepository | None:
-    """master key가 설정된 경우에만 encrypted repository를 활성화한다."""
+    """master key가 설정된 경우에만 encrypted repository를 활성화한다.
+
+    백엔드는 KPUBDATA_BUILDER_STORAGE_BACKEND 를 따른다 (ADR 0013): cubrid 이면 전역
+    Engine 을 공유하는 CubridCredentialRepository, 아니면 기본 SQLite 파일.
+    """
     encoded_key = os.environ.get(_CREDENTIAL_MASTER_KEY_ENV)
     if not encoded_key:
         return None
     cipher = AesGcmCredentialCipher.from_base64(encoded_key)
+    if storage_backend() == "cubrid":
+        from ..credentials.store_cubrid import CubridCredentialRepository
+        from ..store.backend import get_engine
+
+        return CubridCredentialRepository(get_engine(), cipher)
     return SQLiteCredentialRepository(
         output_root / ".service" / "provider-credentials.sqlite3", cipher
     )
