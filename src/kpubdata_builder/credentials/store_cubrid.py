@@ -50,7 +50,10 @@ class CubridCredentialRepository:
             self._metadata,
             Column("owner_id", String(255), primary_key=True),
             Column("provider", String(64), primary_key=True),
-            Column("ciphertext", LargeBinary, nullable=False),
+            # CUBRID 는 BLOB 컬럼에 NOT NULL 제약을 허용하지 않는다(errno -1014). 따라서
+            # nullable 로 두고, 애플리케이션이 항상 ciphertext 를 기록/검증한다(put 은
+            # 비어있지 않은 credential 만 받고 encrypt 결과를 저장, get_secret 은 None 처리).
+            Column("ciphertext", LargeBinary),
             Column("updated_at", String(40), nullable=False),
         )
         self._table.create(self._engine, checkfirst=True)
