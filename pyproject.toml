@@ -90,6 +90,14 @@ strict = true
 warn_unused_configs = true
 mypy_path = ["src"]
 
+# CUBRID 백엔드 의존성은 optional(Python 3.12+ 전용, ADR 0013)이라 기본 dev 환경
+# (3.10/3.11)에는 설치되지 않는다. 미설치 시 "cannot find module" 로 실패하지 않도록
+# missing import 를 무시한다 — 설치된 3.12 환경에서는 각 패키지의 실제 타입(py.typed)을
+# 그대로 사용하므로 타입 검사 정확도는 유지된다.
+[[tool.mypy.overrides]]
+module = ["sqlalchemy.*", "sqlalchemy_cubrid.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
