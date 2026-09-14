@@ -99,8 +99,13 @@ module = ["sqlalchemy.*", "sqlalchemy_cubrid.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+# cubrid marker 테스트는 기본 제외(sqlalchemy·CUBRID 필요, Python 3.12+ optional extra).
+# 실행: `pytest -m cubrid` (명령행 -m 이 이 기본값을 override 한다).
+addopts = "-ra -m 'not cubrid'"
 testpaths = ["tests"]
+markers = [
+  "cubrid: CUBRID 백엔드 계약/통합 테스트 (기본 제외; sqlalchemy 필요, ADR 0013).",
+]
 
 [tool.uv.sources]
 kpubdata = { path = "../kpubdata", editable = true }
