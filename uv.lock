@@ -800,34 +800,17 @@ wheels = [
 
 [[package]]
 name = "kpubdata"
-version = "0.5.0"
-source = { editable = "../kpubdata" }
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
+    { name = "pyyaml" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
-    { name = "httpx", specifier = ">=0.27,<1" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1,<2" },
-    { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5,<10" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<2" },
-    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.2,<3" },
-    { name = "pandas-stubs", marker = "extra == 'dev'", specifier = ">=2.2,<3" },
-    { name = "pydantic", marker = "extra == 'validation'", specifier = ">=2.7,<3" },
-    { name = "pykrx", marker = "extra == 'dev'", specifier = ">=1.0.45,<2" },
-    { name = "pykrx", marker = "extra == 'krx'", specifier = ">=1.0.45,<2" },
-    { name = "pymdown-extensions", marker = "extra == 'docs'", specifier = ">=10,<11" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2,<9" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5,<6" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<1" },
-    { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.10" },
-    { name = "xmltodict", marker = "extra == 'dev'", specifier = ">=0.13,<1" },
-    { name = "xmltodict", marker = "extra == 'xml'", specifier = ">=0.13,<1" },
+sdist = { url = "https://files.pythonhosted.org/packages/df/c4/03439205a93302cdee24e2f749c704c3ef5eacd1ff92368561e2d9c9c2be/kpubdata-0.6.0.tar.gz", hash = "sha256:24532cdfd514a595f78360b87412f54718e4fe81d4d357381c4dadada4e71795", size = 702031, upload-time = "2026-09-09T11:15:27.691Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/c8/5247ee7cffee7d69b1cace554dd4d803b1d366244afacf0d835e97dc3da9/kpubdata-0.6.0-py3-none-any.whl", hash = "sha256:6d8229cc27d4b7128c7aa81f60dde65e0a5219a0c06d75cf6334400549f7050b", size = 190932, upload-time = "2026-09-09T11:15:25.814Z" },
 ]
-provides-extras = ["xml", "pandas", "krx", "validation", "mcp", "dev", "docs"]
 
 [[package]]
 name = "kpubdata-builder"
@@ -885,7 +868,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'huggingface'", specifier = ">=0.23,<2" },
     { name = "huggingface-hub", marker = "extra == 'publish'", specifier = ">=0.23,<2" },
     { name = "kaggle", marker = "extra == 'publish'", specifier = ">=1.6,<2" },
-    { name = "kpubdata", editable = "../kpubdata" },
+    { name = "kpubdata", specifier = ">=0.6.0,<0.7" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6,<2" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9,<10" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<3" },
