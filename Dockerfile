@@ -10,7 +10,10 @@
 # 기동하지 않는다 (docker-entrypoint.sh에서 강제). 베이스는 pragmatic한 python-slim
 # (ADR-0006 미해결 질문: distroless 대안은 후속).
 
-FROM python:3.12-slim
+# Debian 12(bookworm)로 고정한다 (#581). `python:3.12-slim` 이 최근 Debian 13(trixie)로
+# 이동하면서 아직 mirror 에 배포되지 않은 OS 패키지 CVE(perl/gzip/pcre2 등)가 Trivy 스캔에
+# HIGH/CRITICAL 로 잡혔다 — 성숙한 stable 인 bookworm 은 해당 보안 패치가 이미 반영돼 있다.
+FROM python:3.12-slim-bookworm
 
 # 베이스 이미지에 포함된 Debian 패키지의 보안 패치를 적용한다.
 RUN apt-get update \
