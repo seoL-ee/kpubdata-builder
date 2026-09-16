@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from ..spec import JsonValue
 from ..uploads import resolve_max_upload_bytes
 from .app import BuilderService, FileResponse, dispatch
-from .auth import validate_oidc_config
+from .auth import validate_dev_mode, validate_oidc_config
 
 # 단일 요청이 메모리를 고갈시키거나 단일 스레드 서버를 멈추게 하지 않도록 body 크기를
 # 제한한다. spec YAML 요청에 충분하면서도 남용을 막는 보수적 상한 (#186).
@@ -235,6 +235,10 @@ def make_handler(service: BuilderService) -> type[BaseHTTPRequestHandler]:
                 origin: 요청의 Origin 헤더값. None이면 same-origin으로 간주한다.
             """
             allowed = _get_allowed_origins()
+            # 응답의 CORS 헤더가 요청 Origin에 따라 달라지므로, 허용 여부와 무관하게
+            # 항상 Vary: Origin을 보낸다. 이게 없으면 캐싱 프록시/CDN이 한 오리진용
+            # Access-Control-Allow-Origin 응답을 다른 오리진에 그대로 돌려줄 수 있다.
+            self.send_header("Vary", "Origin")
             # Same-origin이거나 허용 목록에 있으면 CORS 헤더를 보낸다.
             if _is_origin_allowed(origin, allowed):
                 if origin is not None:
@@ -369,6 +373,9 @@ def serve(
     """
     # 기동 시 OIDC 설정 검증 (fail-closed, #385). OIDC 비활성 시 no-op.
     validate_oidc_config()
+    # dev-mode로 기동하면 인증이 통째로 꺼진다 — 운영 배포에서 사고가 나지 않도록
+    # 경고를 남기고, 모순된 조합(OIDC 구성 + dev-mode)은 기동을 거부한다.
+    validate_dev_mode()
     server = BoundedThreadingHTTPServer(
         (host, port), make_handler(service), max_workers=max_workers
     )

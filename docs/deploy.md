@@ -185,6 +185,14 @@ issuer·audience·JWKS 서명·만료 검증은 항상 fail-closed로 유지한�
 `OIDC_ALLOWED_SUBJECTS`, `OIDC_ALLOWED_EMAILS`는 필수가 아니라 제한 배포에서만 쓰는
 선택적 2차 인가 규칙이다. 하나라도 설정하면 일치하지 않는 principal은 403이다.
 
+제한 배포에서 허용 목록 누락을 **기동 실패로** 잡고 싶으면
+`OIDC_LEGACY_REQUIRE_ALLOWLIST=true`를 설정한다 — `OIDC_ISSUER`가 있는데 허용 목록이
+하나도 없으면 `serve`가 거부한다. 미설정(기본)이면 공개 가입 정책이 적용된다.
+
+`KPUBDATA_BUILDER_DEV_MODE`는 **인증을 통째로 우회**하므로 로컬 개발 전용이다. 켜진 채로
+기동하면 경고 로그를 남기고, `OIDC_ISSUER`가 함께 설정돼 있으면 (사용자 인증을 구성해두고
+인증을 우회하는 모순된 조합이므로) `serve`가 기동을 거부한다.
+
 Keycloak Admin Console에서 realm의 User registration과 Verify email을 켜고 적절한
 password policy를 설정한다. Google Identity Broker를 사용하려면 broker의 Store Tokens는
 꺼 둔다. Studio가 Google token을 Builder에 직접 전달하지 않으며, signup/password UI는
