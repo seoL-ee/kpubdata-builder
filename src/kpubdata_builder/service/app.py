@@ -80,6 +80,7 @@ from . import publish as publish_service
 from . import quality as quality_service
 from . import stages as stages_service
 from .auth import AuthError, Principal, authenticate
+from .auth_throttle import AuthFailureThrottle
 from .jobs import AsyncBuildExecutor, generate_run_id
 from .providers import (
     CredentialResolver,
@@ -515,6 +516,8 @@ class BuilderService:
         # Monitoring API용 bounded latency recorder (#516). dispatch()가 매 요청
         # 처리 시간을 기록한다 — 인스턴스별로 분리해 테스트 간 상태가 섞이지 않는다.
         self._latency_recorder = monitoring_service.LatencyRecorder()
+        # 인증 실패 스로틀. latency recorder와 같은 이유로 인스턴스별로 둔다.
+        self._auth_throttle = AuthFailureThrottle()
         # 외부 publish side effect의 durable idempotency receipt. 객체 생성은
         # 파일을 만들지 않으며 최초 POST claim 때 SQLite를 지연 초기화한다.
         self._publish_receipts = publish_service.PublishReceiptStore(output_root)
@@ -2658,6 +2661,7 @@ def dispatch(
     api_key: str | None = None,
     bearer_token: str | None = None,
     raw_body: bytes | None = None,
+    client_id: str | None = None,
 ) -> ServiceResponse | FileResponse:
     """``_dispatch_impl``을 호출하고 처리 시간을 Monitoring latency 표본으로
     기록한다 (#516).
@@ -2680,6 +2684,7 @@ def dispatch(
             api_key=api_key,
             bearer_token=bearer_token,
             raw_body=raw_body,
+            client_id=client_id,
         )
     finally:
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -2696,12 +2701,17 @@ def _dispatch_impl(
     api_key: str | None = None,
     bearer_token: str | None = None,
     raw_body: bytes | None = None,
+    client_id: str | None = None,
 ) -> ServiceResponse | FileResponse:
     """(method, path)를 BuilderService 연산으로 라우팅한다.
 
     GET /healthz는 인증 없이 반환하고 (#372), 그 외 엔드포인트는
     authenticate()로 Principal을 얻어 인증 게이트를 통과한 후 라우팅한다.
     dev-mode이면 인증 생략, 그 외는 fail-closed(401)로 동작한다 (#248, #384).
+
+    ``client_id``(HTTP 계층이 넘기는 TCP peer 주소)가 있으면 인증 실패를 세어
+    반복 시도를 429로 끊는다. 실패 누적 자체를 인증보다 먼저 확인해, 막힌
+    클라이언트는 키 비교·서명 검증 비용조차 발생시키지 못한다.
 
     반환값:
         ServiceResponse 또는 FileResponse (#323).
@@ -2710,10 +2720,30 @@ def _dispatch_impl(
     if method == "GET" and path == "/healthz":
         return ServiceResponse(200, {"status": "ok"})
 
+    # 인증 실패가 누적된 클라이언트는 인증을 시도하기도 전에 끊는다.
+    retry_after = service._auth_throttle.retry_after(client_id)
+    if retry_after is not None:
+        return ServiceResponse(
+            429,
+            {
+                "error": "too many failed authentication attempts",
+                "code": "auth_throttled",
+                "retry_after_seconds": retry_after,
+            },
+        )
+
     # 인증 게이트 (#384): Principal을 얻지 못하면 401.
     principal = authenticate(api_key=api_key, bearer_token=bearer_token)
     if isinstance(principal, AuthError):
+        # 401(잘못된 자격증명)만 센다 — 403은 유효한 토큰의 인가 실패라 추측 가치가
+        # 없고, 503은 JWKS 일시 장애라 클라이언트 잘못이 아니다.
+        if principal.status_code == 401:
+            service._auth_throttle.record_failure(client_id)
         return ServiceResponse(principal.status_code, {"error": principal.reason})
+
+    # 성공한 인증은 실패 기록을 비운다 — 토큰 만료로 몇 번 401을 받은 정상
+    # 클라이언트가 이후 정상 사용 중에 스로틀에 걸리지 않는다.
+    service._auth_throttle.record_success(client_id)
 
     # /uploads(#498)는 binary body(raw_body)가 필요한 유일한 endpoint라 표준
     # RouteAdapter(JSON body만 받음) 목록에 넣지 않고 여기서 직접 호출한다 —
