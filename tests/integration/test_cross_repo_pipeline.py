@@ -32,18 +32,23 @@ import yaml
 from kpubdata_builder.service.app import BuilderService, ServiceResponse, dispatch
 from kpubdata_builder.spec import JsonValue
 
-# replay fixture가 있는 데이터셋 중 **한 페이지로 끝나는** 것을 고른다
-# (totalCount 20 ≤ page_size 100). Builder Bronze는 kpubdata Dataset을 보면
-# `list_all()`로 페이지를 끝까지 도는데, 2페이지를 요청하면 기록된 fixture가
-# 없어 replay가 실패한다 — 단일 페이지 fixture여야 결정적으로 통과한다.
-_DATASET = "apt_trade"
+# 데이터셋 선택 조건 두 가지:
+#
+# 1. **한 페이지로 끝나야 한다** (totalCount 22 ≤ page_size 100). Builder Bronze는
+#    kpubdata Dataset을 보면 `list_all()`로 페이지를 끝까지 도는데, 2페이지를
+#    요청하면 기록된 fixture가 없어 replay가 실패한다.
+# 2. **혼합 타입 컬럼이 없어야 한다.** spec이 `integer`로 선언한 필드에 숫자가 아닌
+#    값이 섞여 있으면 kpubdata가 일부만 int로 캐스팅해 한 컬럼에 int/str이 공존하고,
+#    Builder Silver가 이를 거부한다(yeongseon/kpubdata#452). apt_trade/sh_trade/
+#    ultra_srt_ncst가 여기 걸린다 — 이 테스트가 처음 돌 때 그 문제를 잡아냈다.
+_DATASET = "air_station"
 _PARAMS: dict[str, JsonValue] = {
-    "LAWD_CD": "11110",
-    "DEAL_YMD": "202401",
+    "station": "강남구",
+    "term": "daily",
     "page": 1,
     "page_size": 100,
 }
-_EXPECTED_ROWS = 20
+_EXPECTED_ROWS = 22
 
 
 def _replay_dir() -> Path | None:
@@ -87,7 +92,7 @@ def _spec_yaml() -> str:
                 "provider": "datago",
                 "dataset": _DATASET,
                 "params": _PARAMS,
-                "alias": "trades",
+                "alias": "measurements",
             }
         ],
         "exports": [{"kind": "jsonl", "output_path": "out/data.jsonl"}],
@@ -142,11 +147,11 @@ class TestCrossRepoPipeline:
         assert response.status_code == 200, response.body
 
         # export는 Gold 단계 아래 source alias 디렉터리에 기록된다.
-        exported = tmp_path / "cross-repo-export" / "gold" / "trades" / "out" / "data.jsonl"
+        exported = tmp_path / "cross-repo-export" / "gold" / "measurements" / "out" / "data.jsonl"
         assert exported.exists(), "jsonl export가 기록되지 않았다"
         rows = [json.loads(line) for line in exported.read_text(encoding="utf-8").splitlines()]
         assert len(rows) == _EXPECTED_ROWS
 
-        # 실거래가 API의 실제 필드명(영문)이 그대로 실려야 한다. kpubdata가 필드를
-        # 리네임하거나 응답 구조를 바꾸면 Studio 화면이 깨지는데, 그 회귀를 여기서 잡는다.
-        assert {"aptNm", "dealAmount", "dealYear"} <= set(rows[0]), sorted(rows[0])
+        # 대기측정 API의 실제 필드명이 그대로 실려야 한다. kpubdata가 필드를 리네임하거나
+        # 응답 구조를 바꾸면 Studio 화면이 깨지는데, 그 회귀를 여기서 잡는다.
+        assert {"dataTime", "pm10Value", "khaiValue"} <= set(rows[0]), sorted(rows[0])
