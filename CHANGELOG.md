@@ -25,6 +25,7 @@
 - 컨테이너 진입점 fail-closed (ADR 0006)
 
 ### 변경됨
+- **dataset 도메인 서비스 분리 (#596 네 번째 조각)**: built dataset 조회 표면(`/datasets`, `/datasets/{id}`, `/runs`, quality 이력)을 `service/datasets_api.py` 의 `DatasetsApiService` 로 옮기고 `BuilderService` 는 얇은 위임으로 남긴다. run record 수집 헬퍼는 quality 도메인이 함께 쓰므로 **public 으로 노출**해 다음 조각이 복제 대신 의존할 수 있게 했다. ownership 필터를 grouping/latest 선정보다 먼저 적용하는 규칙(#488 semantics D)은 파일 docstring 에 명시했다. wire 계약 변화 없음
 - **query 도메인 서비스 분리 (#596 세 번째 조각)**: `POST /query` 를 `service/query_service_api.py` 의 `QueryApiService` 로 옮기고 `BuilderService` 는 얇은 위임으로 남긴다. 요청 본문 파서도 함께 옮겨, 권한·아티팩트 부재·문맥 오류·안전하지 않은 SQL·혼잡·타임아웃·실행 실패가 각각 어떤 상태 코드와 `code` 가 되는지 한 곳에서 읽힌다. 모듈명이 `query_service_api` 인 이유는 `kpubdata_builder.query.service` 에 이미 실행 엔진 쪽 `QueryService` 가 있어서다. wire 계약 변화 없음
 - **upload 도메인 서비스 분리 (#596 두 번째 조각)**: `create_upload`/`get_upload`/`delete_upload` 를 `service/uploads_service.py` 의 `UploadsService` 로 옮기고 `BuilderService` 는 얇은 위임으로 남긴다. 저장소를 객체가 아니라 **호출 가능한 provider**(람다)로 넘겨, upload 를 쓰지 않는 워크스페이스에 `.service/uploads.sqlite3` 가 생기지 않는 지연 생성(#498)을 그대로 보존한다. wire 계약 변화 없음
 - **provider 도메인 서비스 분리 (#596 첫 조각)**: `BuilderService` 가 providers/uploads/query/builds/datasets/quality 를 한 클래스에 들고 있던 구조를 도메인별로 나누기 시작한다. provider 목록·연결 테스트·credential CRUD 를 `service/providers_service.py` 의 `ProvidersService` 로 옮기고, `BuilderService` 의 해당 메서드는 얇은 위임으로 남긴다. 새 서비스는 **자기 의존성만** 받는다(credential resolver·client 팩토리·provider test 설정) — `BuilderService` 를 통째로 주입받으면 클래스만 늘고 결합은 그대로다. wire 계약(상태 코드·본문 키·라우팅·인증 게이트)은 바뀌지 않는다

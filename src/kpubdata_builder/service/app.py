@@ -22,7 +22,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
 from urllib.parse import unquote, urlsplit
@@ -72,6 +72,7 @@ from . import quality as quality_service
 from . import stages as stages_service
 from .auth import AuthError, Principal, authenticate
 from .auth_throttle import AuthFailureThrottle
+from .datasets_api import DatasetsApiService
 from .jobs import AsyncBuildExecutor, generate_run_id
 from .providers import (
     CredentialResolver,
@@ -537,6 +538,9 @@ class BuilderService:
         # property 를 호출하는 람다를 넘겨 그 지연 생성을 그대로 유지한다.
         self._uploads_service = UploadsService(repository=lambda: self._upload_repository)
         self._query_api = QueryApiService(output_root=self._output_root, engine=self._query_service)
+        self._datasets_api = DatasetsApiService(
+            output_root=self._output_root, build_index=self._build_index, store=self._store
+        )
         self._async_builds = AsyncBuildExecutor(
             max_workers=async_max_workers,
             max_queue_size=async_max_queue_size,
@@ -1452,172 +1456,45 @@ class BuilderService:
         return ServiceResponse(200, {"builds": cast(list[JsonValue], filtered)})
 
     def _dataset_records(self, principal: Principal | None) -> list[datasets_service.RunRecord]:
-        """dataset_id가 있는 접근 가능한 모든 run을 얻는다 (인덱스 우선, 파일시스템 폴백).
-
-        ownership 필터를 grouping/latest 선정보다 먼저 적용한다 — 동일 dataset_id의
-        타 사용자 run이 latest 후보에 섞이지 않게 한다 (#488 semantics D).
-        """
-        index_records = datasets_service.collect_run_records_from_index(self._build_index) or []
-        filesystem_records = datasets_service.collect_run_records_from_filesystem(self._output_root)
-        records = datasets_service.merge_run_records(index_records, filesystem_records)
-        records = datasets_service.retain_canonical_run_records(self._output_root, records)
-        return datasets_service.filter_ownership(records, principal, enforce=_enforce_ownership())
+        return self._datasets_api.dataset_records(principal)
 
     def _dataset_records_for(
         self, dataset_id: str, principal: Principal | None
     ) -> list[datasets_service.RunRecord]:
-        """특정 dataset_id의 접근 가능한 canonical run을 모두 얻는다."""
-        return [
-            record for record in self._dataset_records(principal) if record.dataset_id == dataset_id
-        ]
+        return self._datasets_api.dataset_records_for(dataset_id, principal)
 
     def _recent_canonical_records(
         self, principal: Principal | None, *, now: datetime, window_seconds: int
     ) -> list[datasets_service.RunRecord]:
-        """최근 ``window_seconds`` 안 candidate run을 canonical 정본으로 확정한다 (#488 후속 리뷰).
-
-        candidate run_id는 두 신호의 합집합이다:
-          - canonical ``manifest.json``의 mtime이 window 안(margin 포함)인 run.
-            mtime은 run 완료 시 만들어지는 정본 파일 자체의 것이라 항상
-            ``manifest.finished_at`` 이상이므로 window 안 run을 떨어뜨리지 않고,
-            ``stat``만 하므로 historical manifest/snapshot을 파싱하지 않는다.
-          - ``BuildIndex.list_between``의 window 안 run (파생 index fast lookup).
-
-        BuildIndex는 파생 검색 index이고 write는 best-effort다 (ADR 0003: "권위
-        없음", manifest와의 reconcile 시점 미정) — 누락되거나 stale한 row가 정본
-        24h aggregate를 바꾸면 안 되므로, index 단독으로 좁히지 않고 위 mtime
-        후보로 보강한다. index 조회가 실패해도 mtime 후보가 이미 전체를 커버한다.
-
-        확정된 candidate만 snapshot+manifest로 재검증하며(``canonical_records_for_run_ids``),
-        정확한 ``(now-window, now]`` 경계와 ``finished_at``/``started_at`` fallback,
-        ownership은 그 canonical 값으로 이후 단계(``aggregate_quality_window`` /
-        ``filter_ownership``)에서 적용한다.
-        """
-        margin_seconds = window_seconds + _QUALITY_WINDOW_MTIME_MARGIN_SECONDS
-        mtime_cutoff = now.timestamp() - margin_seconds
-        candidate_run_ids: set[str] = set()
-        if self._output_root.exists():
-            for run_dir in self._output_root.iterdir():
-                if not run_dir.is_dir():
-                    continue
-                try:
-                    manifest_mtime = (run_dir / "manifest.json").stat().st_mtime
-                except OSError:
-                    continue  # manifest 부재/접근 불가 — 완료된 run 아님
-                if manifest_mtime >= mtime_cutoff:
-                    candidate_run_ids.add(run_dir.name)
-        lower = (now - timedelta(seconds=margin_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        upper = (now + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # 파생 index 조회가 실패해도 mtime 후보가 이미 전체 run을 커버한다.
-        with suppress(Exception):
-            candidate_run_ids.update(
-                entry.run_id for entry in self._build_index.list_between(lower, upper)
-            )
-        canonical = datasets_service.canonical_records_for_run_ids(
-            self._output_root, candidate_run_ids
+        return self._datasets_api.recent_canonical_records(
+            principal, now=now, window_seconds=window_seconds
         )
-        return datasets_service.filter_ownership(canonical, principal, enforce=_enforce_ownership())
 
     def list_datasets(
         self, *, limit: int = 50, principal: Principal | None = None
     ) -> ServiceResponse:
-        """동일 dataset_id의 여러 run을 하나의 built dataset으로 묶어 목록을 반환한다 (#488).
-
-        각 dataset은 접근 가능한 run 중 latest run(finished_at 기준, 동일 시각은
-        run_id 내림차순 타이브레이크)의 canonical snapshot·manifest·stage 상태로
-        요약된다. legacy run(snapshot 없음)은 grouping 대상에서 제외된다.
-
-        `total`은 canonical grouping + ownership 필터 이후, pagination(limit) 이전의
-        distinct dataset 개수다(#488 후속, additive) — limit이 무한이면 `datasets`에
-        실릴 항목 수와 같다. 다른 principal 소유 run만 있는 dataset은 포함되지 않는다.
-        """
-        records = self._dataset_records(principal)
-        latest_by_dataset = datasets_service.group_latest_by_dataset(records)
-        ordered = sorted(
-            latest_by_dataset.values(),
-            key=datasets_service.sort_key,
-            reverse=True,
-        )
-        # total은 canonical/renderable dataset 개수이므로, expensive full summary
-        # (snapshot+manifest+stage 산출물 probe)는 응답 page(limit)에 실릴 후보에만
-        # 수행한다. page를 채운 뒤로는 total 카운트를 위한 경량 renderability 검증만
-        # 한다 — legacy/손상으로 canonical summary를 만들 수 없는 run은 목록에서도
-        # total에서도 동일하게 제외된다(#488 후속 리뷰: limit=1 + 대량 dataset에서
-        # catalog 전체에 full summary가 도는 regression 방지).
-        items: list[JsonValue] = []
-        total = 0
-        for record in ordered:
-            if len(items) < limit:
-                view = datasets_service.build_dataset_summary(self._output_root, record)
-                if view is None:
-                    continue
-                items.append(view)
-                total += 1
-            elif datasets_service.dataset_summary_renderable(self._output_root, record):
-                total += 1
-        return ServiceResponse(200, {"datasets": items, "total": total})
+        """동일 dataset_id의 여러 run을 하나의 built dataset으로 묶어 목록을 반환한다 (#488)."""
+        return self._datasets_api.list_datasets(limit=limit, principal=principal)
 
     def get_dataset(
         self, dataset_id: str, *, principal: Principal | None = None
     ) -> ServiceResponse:
-        """단일 built dataset의 canonical 요약을 반환한다 (#488).
-
-        접근 가능한 run이 하나도 없으면(dataset_id가 실제로 없거나, 있어도 전부
-        타 사용자 소유이면) 404 — 어느 경우인지는 구분해 노출하지 않는다.
-        """
-        records = self._dataset_records_for(dataset_id, principal)
-        if not records:
-            return ServiceResponse(404, {"error": f"dataset not found: {dataset_id}"})
-        latest = datasets_service.pick_latest(records)
-        view = datasets_service.build_dataset_summary(self._output_root, latest)
-        if view is None:
-            return ServiceResponse(404, {"error": f"dataset not found: {dataset_id}"})
-        view["run_count"] = len(records)
-        return ServiceResponse(200, view)
+        """단일 built dataset의 canonical 요약을 반환한다 (#488)."""
+        return self._datasets_api.get_dataset(dataset_id, principal=principal)
 
     def list_dataset_runs(
         self, dataset_id: str, *, limit: int = 50, principal: Principal | None = None
     ) -> ServiceResponse:
-        """dataset_id의 접근 가능한 run history를 최신순으로 반환한다 (#488).
-
-        타 사용자의 run은 제외된다. 접근 가능한 run이 하나도 없으면 404 —
-        /datasets/{dataset_id}와 동일한 존재 판정 정책을 공유한다.
-        """
-        records = self._dataset_records_for(dataset_id, principal)
-        if not records:
-            return ServiceResponse(404, {"error": f"dataset not found: {dataset_id}"})
-        ordered = sorted(records, key=datasets_service.sort_key, reverse=True)[:limit]
-        runs: list[JsonValue] = [
-            {
-                "run_id": r.run_id,
-                "status": r.status,
-                "started_at": r.started_at,
-                "finished_at": r.finished_at,
-                "spec_digest": r.spec_digest,
-                "created_by": r.created_by,
-            }
-            for r in ordered
-        ]
-        return ServiceResponse(200, {"dataset_id": dataset_id, "runs": runs})
+        """dataset_id의 접근 가능한 run history를 최신순으로 반환한다 (#488)."""
+        return self._datasets_api.list_dataset_runs(dataset_id, limit=limit, principal=principal)
 
     def get_dataset_quality_history(
         self, dataset_id: str, *, limit: int = 30, principal: Principal | None = None
     ) -> ServiceResponse:
-        """dataset_id의 접근 가능한 run들에 대한 quality PASS/WARN/FAIL 집계 이력 (#486).
-
-        dataset→run 조회는 #488의 ``_dataset_records_for``(ownership 필터링 포함)를
-        그대로 재사용한다 — 새 dataset grouping/index를 만들지 않는다. 존재/ownership
-        판정은 ``/datasets/{dataset_id}``, ``/datasets/{dataset_id}/runs``와 동일하다.
-        """
-        records = self._dataset_records_for(dataset_id, principal)
-        if not records:
-            return ServiceResponse(404, {"error": f"dataset not found: {dataset_id}"})
-        ordered = sorted(records, key=datasets_service.sort_key, reverse=True)[:limit]
-        runs: list[JsonValue] = []
-        for r in ordered:
-            manifest = self._store.get_manifest(r.run_id) or {}
-            runs.append(cast(JsonValue, quality_service.summarize_run_quality(r, manifest)))
-        return ServiceResponse(200, {"dataset_id": dataset_id, "runs": runs})
+        """dataset_id의 접근 가능한 run들에 대한 quality 집계 이력 (#486)."""
+        return self._datasets_api.get_dataset_quality_history(
+            dataset_id, limit=limit, principal=principal
+        )
 
     def get_build_quality(self, run_id: str) -> ServiceResponse:
         """run의 구조화된 Quality 결과와 schema drift를 조회한다 (#486, #514).
