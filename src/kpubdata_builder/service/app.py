@@ -38,7 +38,6 @@ from ..credentials import (
 )
 from ..errors import SpecLoadError, ValidationError
 from ..events import BuildEvent, BuildEventStore
-from ..ingestion import IngestionError, parse_tabular_bytes
 from ..manifest import status_from_manifest
 from ..pipeline import (
     DEFAULT_PREVIEW_SEED,
@@ -59,7 +58,6 @@ from ..query.resolver import (
 from ..query.security import UnsafeQueryError, validate_read_only_sql
 from ..query.service import QueryBusyError, QueryService
 from ..spec import BuildSpec, JsonValue, parse_spec
-from ..spec.models import SOURCE_FILE_FORMATS
 from ..spec.serializer import BUILDSPEC_SNAPSHOT_FILENAME, compute_spec_digest
 from ..spec.validator import validate_spec
 from ..stages._path_safety import ensure_within, validate_path_segment
@@ -70,7 +68,6 @@ from ..store.backend import storage_backend
 from ..tabular import DEFAULT_PREVIEW_LIMIT
 from ..uploads import (
     SQLiteUploadRepository,
-    UploadMetadata,
     UploadRepository,
     resolve_max_upload_bytes,
 )
@@ -97,6 +94,7 @@ from .responses import FileResponse, ServiceResponse
 from .routes import ROUTE_ADAPTERS
 from .routes import uploads as uploads_route
 from .routes.core import MAX_PREVIEW_LIMIT
+from .uploads_service import UploadsService
 
 logger = logging.getLogger(__name__)
 
@@ -439,18 +437,6 @@ def _quality_result_to_json(r: QualityCheckResult) -> dict[str, JsonValue]:
     }
 
 
-def _upload_metadata_body(metadata: UploadMetadata) -> dict[str, JsonValue]:
-    """UploadMetadata를 wire JSON으로 변환한다 (#498). content는 절대 포함하지 않는다."""
-    return {
-        "upload_id": metadata.upload_id,
-        "format": metadata.format,
-        "encoding": metadata.encoding,
-        "size_bytes": metadata.size_bytes,
-        "original_filename": metadata.original_filename,
-        "created_at": metadata.created_at,
-    }
-
-
 def _parse_spec_text(spec_yaml: str) -> BuildSpec:
     """YAML 텍스트를 BuildSpec으로 파싱한다."""
     raw = cast(object, yaml.safe_load(spec_yaml))
@@ -554,6 +540,9 @@ class BuilderService:
             provider_test_operation=self._provider_test_operation,
             provider_test_timeout=self._provider_test_timeout,
         )
+        # upload 저장소는 처음 필요할 때만 SQLite 를 만든다 (#498) — 저장소 객체가 아니라
+        # property 를 호출하는 람다를 넘겨 그 지연 생성을 그대로 유지한다.
+        self._uploads_service = UploadsService(repository=lambda: self._upload_repository)
         self._async_builds = AsyncBuildExecutor(
             max_workers=async_max_workers,
             max_queue_size=async_max_queue_size,
@@ -679,53 +668,22 @@ class BuilderService:
         original_filename: str | None,
         principal: Principal,
     ) -> ServiceResponse:
-        """업로드 content를 저장하고 즉시 파싱 가능한지 검증한다 (#498).
-
-        저장은 owner_id로 격리된다 — 나중에 BuildSpec의 ``kind="file"`` source가
-        이 upload_id를 참조하려면 같은 principal이어야 한다(``build``/``preview``의
-        resolver가 다시 확인한다). 파싱 가능성은 여기서 fail-fast로 확인한다 —
-        나중에 build 시점에야 손상된 파일임을 알게 되는 것을 피한다.
-        """
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        if format not in SOURCE_FILE_FORMATS:
-            return ServiceResponse(
-                400,
-                {"error": f"format must be one of {SOURCE_FILE_FORMATS}, got {format!r}"},
-            )
-        try:
-            _ = parse_tabular_bytes(raw, format=format, encoding=encoding)
-        except IngestionError as exc:
-            return ServiceResponse(400, {"error": str(exc)})
-        try:
-            metadata = self._upload_repository.put(
-                principal.owner_id,
-                content=raw,
-                format=format,
-                encoding=encoding,
-                original_filename=original_filename,
-            )
-        except ValueError as exc:
-            return ServiceResponse(400, {"error": str(exc)})
-        return ServiceResponse(200, _upload_metadata_body(metadata))
+        """업로드 content를 저장하고 즉시 파싱 가능한지 검증한다 (#498)."""
+        return self._uploads_service.create_upload(
+            raw,
+            format=format,
+            encoding=encoding,
+            original_filename=original_filename,
+            principal=principal,
+        )
 
     def get_upload(self, upload_id: str, *, principal: Principal) -> ServiceResponse:
         """현재 principal 소유 업로드의 안전한 메타데이터만 반환한다 (content 제외)."""
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        metadata = self._upload_repository.get_metadata(principal.owner_id, upload_id)
-        if metadata is None:
-            return ServiceResponse(404, {"error": f"upload not found: {upload_id}"})
-        return ServiceResponse(200, _upload_metadata_body(metadata))
+        return self._uploads_service.get_upload(upload_id, principal=principal)
 
     def delete_upload(self, upload_id: str, *, principal: Principal) -> ServiceResponse:
         """현재 principal 소유 업로드만 삭제한다."""
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        deleted = self._upload_repository.delete(principal.owner_id, upload_id)
-        if not deleted:
-            return ServiceResponse(404, {"error": f"upload not found: {upload_id}"})
-        return ServiceResponse(200, {"upload_id": upload_id, "deleted": True})
+        return self._uploads_service.delete_upload(upload_id, principal=principal)
 
     def query(
         self, body: Mapping[str, JsonValue] | None, *, principal: Principal
