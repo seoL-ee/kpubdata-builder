@@ -287,8 +287,12 @@ def test_dataset_detail_example_matches_service_serializer(
         ],
     )
     service = BuilderService(output_root=tmp_path, client_factory=lambda: cast(object, None))
+    # dataset record 수집은 datasets 도메인 서비스로 옮겨갔다 (#596) — BuilderService 의
+    # 동명 메서드는 위임일 뿐이라, 그쪽을 patch 하면 호출 경로에서 빠진다.
     monkeypatch.setattr(
-        service, "_dataset_records_for", lambda dataset_id, principal: [record, older_record]
+        service._datasets_api,
+        "dataset_records_for",
+        lambda dataset_id, principal: [record, older_record],
     )
 
     response = service.get_dataset("seoul-air-quality")
