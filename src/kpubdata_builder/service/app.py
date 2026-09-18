@@ -90,11 +90,9 @@ from .providers import (
     ProviderDescriptor,
     ProviderTestOperation,
     default_provider_test,
-    provider_descriptors,
-    run_provider_test,
     runtime_provider_catalog,
-    test_result_body,
 )
+from .providers_service import ProvidersService
 from .responses import FileResponse, ServiceResponse
 from .routes import ROUTE_ADAPTERS
 from .routes import uploads as uploads_route
@@ -545,6 +543,17 @@ class BuilderService:
         )
         if self._provider_test_timeout <= 0:
             raise ValueError("provider test timeout must be positive")
+        # provider 도메인은 자기 의존성만 받는 별도 서비스로 나갔다 (#596). 여기서는
+        # 조립만 하고, BuilderService 의 provider 메서드는 얇은 위임으로 남는다.
+        self._providers_service = ProvidersService(
+            credential_resolver=self._credential_resolver,
+            create_client=self._create_client,
+            close_client=lambda client: (
+                _close_request_client(client) if client is not None else None
+            ),
+            provider_test_operation=self._provider_test_operation,
+            provider_test_timeout=self._provider_test_timeout,
+        )
         self._async_builds = AsyncBuildExecutor(
             max_workers=async_max_workers,
             max_queue_size=async_max_queue_size,
@@ -630,98 +639,22 @@ class BuilderService:
         return self._client_factory(**kwargs)
 
     def _runtime_providers(self) -> tuple[ProviderDescriptor, ...] | ServiceResponse:
-        client = self._create_client()
-        try:
-            return provider_descriptors(client)
-        except Exception as exc:
-            logger.exception("provider catalog unavailable")
-            return ServiceResponse(502, {"error": f"catalog unavailable: {exc}"})
-        finally:
-            _close_request_client(client)
+        return self._providers_service.runtime_providers()
 
     def _known_provider(self, provider: str) -> ProviderDescriptor | ServiceResponse:
-        providers = self._runtime_providers()
-        if isinstance(providers, ServiceResponse):
-            return providers
-        match = next((item for item in providers if item.name == provider), None)
-        if match is None:
-            return ServiceResponse(404, {"error": "provider not found"})
-        return match
+        return self._providers_service.known_provider(provider)
 
     def providers(self, *, principal: Principal) -> ServiceResponse:
         """런타임 Provider 목록과 현재 principal의 configured 상태를 반환한다."""
-        descriptors = self._runtime_providers()
-        if isinstance(descriptors, ServiceResponse):
-            return descriptors
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        items: list[JsonValue] = []
-        for descriptor in descriptors:
-            resolved = self._credential_resolver.resolve(principal.owner_id, descriptor.name)
-            configured = not descriptor.requires_credential or resolved.value is not None
-            items.append(
-                {
-                    "provider": descriptor.name,
-                    "requires_credential": descriptor.requires_credential,
-                    "configured": configured,
-                }
-            )
-        return ServiceResponse(200, {"providers": items})
+        return self._providers_service.providers(principal=principal)
 
     def provider_status(self, provider: str, *, principal: Principal) -> ServiceResponse:
         """현재 principal credential로 lightweight connection test를 수행한다."""
-        descriptor = self._known_provider(provider)
-        if isinstance(descriptor, ServiceResponse):
-            return descriptor
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        resolved = self._credential_resolver.resolve(principal.owner_id, provider)
-        configured = not descriptor.requires_credential or resolved.value is not None
-        client: SourceClient | None = None
-        try:
-            if configured:
-                client = self._create_client(
-                    principal, providers=(provider,), timeout=self._provider_test_timeout
-                )
-            result = run_provider_test(
-                provider=provider,
-                configured=configured,
-                client=client,
-                operation=self._provider_test_operation,
-            )
-            return ServiceResponse(200, cast(dict[str, JsonValue], test_result_body(result)))
-        except Exception:
-            # Client 생성 실패도 원문 예외를 로그/응답하지 않고 unknown으로 제한한다.
-            result = run_provider_test(
-                provider=provider,
-                configured=True,
-                client=cast(SourceClient, object()),
-                operation=_raise_provider_test_error,
-            )
-            return ServiceResponse(200, cast(dict[str, JsonValue], test_result_body(result)))
-        finally:
-            if client is not None:
-                _close_request_client(client)
+        return self._providers_service.provider_status(provider, principal=principal)
 
     def provider_credential(self, provider: str, *, principal: Principal) -> ServiceResponse:
         """원문 없이 현재 principal의 저장 credential 메타데이터를 반환한다."""
-        known = self._known_provider(provider)
-        if isinstance(known, ServiceResponse):
-            return known
-        repository = self._credential_resolver.repository
-        if repository is None:
-            return ServiceResponse(503, {"error": "credential store is not configured"})
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        metadata = repository.get_metadata(principal.owner_id, provider)
-        return ServiceResponse(
-            200,
-            {
-                "configured": metadata.configured,
-                "masked": metadata.masked,
-                "updated_at": metadata.updated_at,
-            },
-        )
+        return self._providers_service.provider_credential(provider, principal=principal)
 
     def put_provider_credential(
         self,
@@ -731,45 +664,11 @@ class BuilderService:
         principal: Principal,
     ) -> ServiceResponse:
         """현재 principal의 Provider credential을 생성 또는 교체한다."""
-        known = self._known_provider(provider)
-        if isinstance(known, ServiceResponse):
-            return known
-        repository = self._credential_resolver.repository
-        if repository is None:
-            return ServiceResponse(503, {"error": "credential store is not configured"})
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        if body is None or set(body) != {"credential"}:
-            return ServiceResponse(400, {"error": "body must contain only 'credential'"})
-        credential = body.get("credential")
-        if not isinstance(credential, str) or not credential.strip():
-            return ServiceResponse(400, {"error": "credential must be a non-empty string"})
-        metadata = repository.put(principal.owner_id, provider, credential)
-        return ServiceResponse(
-            200,
-            {
-                "provider": metadata.provider,
-                "configured": metadata.configured,
-                "masked": metadata.masked,
-                "updated_at": metadata.updated_at,
-            },
-        )
+        return self._providers_service.put_provider_credential(provider, body, principal=principal)
 
     def delete_provider_credential(self, provider: str, *, principal: Principal) -> ServiceResponse:
         """현재 principal의 Provider credential만 삭제한다."""
-        known = self._known_provider(provider)
-        if isinstance(known, ServiceResponse):
-            return known
-        repository = self._credential_resolver.repository
-        if repository is None:
-            return ServiceResponse(503, {"error": "credential store is not configured"})
-        if principal.owner_id is None:
-            return ServiceResponse(403, {"error": "stable principal is required"})
-        _ = repository.delete(principal.owner_id, provider)
-        return ServiceResponse(
-            200,
-            {"provider": provider, "configured": False, "masked": None, "updated_at": None},
-        )
+        return self._providers_service.delete_provider_credential(provider, principal=principal)
 
     def create_upload(
         self,

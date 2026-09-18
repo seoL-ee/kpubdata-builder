@@ -25,6 +25,7 @@
 - 컨테이너 진입점 fail-closed (ADR 0006)
 
 ### 변경됨
+- **provider 도메인 서비스 분리 (#596 첫 조각)**: `BuilderService` 가 providers/uploads/query/builds/datasets/quality 를 한 클래스에 들고 있던 구조를 도메인별로 나누기 시작한다. provider 목록·연결 테스트·credential CRUD 를 `service/providers_service.py` 의 `ProvidersService` 로 옮기고, `BuilderService` 의 해당 메서드는 얇은 위임으로 남긴다. 새 서비스는 **자기 의존성만** 받는다(credential resolver·client 팩토리·provider test 설정) — `BuilderService` 를 통째로 주입받으면 클래스만 늘고 결합은 그대로다. wire 계약(상태 코드·본문 키·라우팅·인증 게이트)은 바뀌지 않는다
 - **CUBRID CI 가 실제로 CUBRID 를 검증하도록 고정 (#587)**: 전용 잡의 engine fixture 는 `KPUBDATA_BUILDER_CUBRID_URL` 이 없으면 조용히 in-memory SQLite 로 내려앉는다 — URL 주입이 빠지면 **CUBRID dialect 를 한 줄도 건드리지 않은 채 잡이 초록으로 통과**했다. `KPUBDATA_BUILDER_REQUIRE_REAL_CUBRID=1`(잡이 설정) 이면 폴백을 금지하고, dialect/driver 가 `cubrid`/`pycubrid` 인지 단언하는 테스트를 추가했다. 잡에 누락돼 있던 `KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid` 도 주입하고, 기동 전 설정 검증(fail-closed) 테스트와 `cubrid` 마커 설명의 ADR 번호 오기(0013 → 0016)를 함께 고쳤다
 - **패키지 버전을 CHANGELOG 라인에 맞춤 (#592)**: `pyproject.toml` 의 `version` 을 `0.1.0` → `0.4.0.dev0` 으로 올려 이 문서의 v0.4 절과 일치시킨다. `kpubdata_builder.__version__` 은 하드코딩 문자열을 버리고 설치된 배포판 메타데이터에서 파생하므로 버전 정본은 `pyproject.toml` 한 곳뿐이다 — 그동안 GHCR 이미지 태그·`--version` 출력·manifest 의 `builder_version` 이 모두 0.1.0 을 주장하고 있었다. `tests/unit/test_version.py` 가 세 값의 재이탈을 막는다
 - API 계약 1.21.0 → 1.22.0 (`GET /datasets`에 `total` 추가, `GET /quality/summary` 추가, additive, #488/#486 후속)
