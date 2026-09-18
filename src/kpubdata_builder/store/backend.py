@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import TYPE_CHECKING, Literal
@@ -26,6 +27,18 @@ if TYPE_CHECKING:
 
 _BACKEND_ENV = "KPUBDATA_BUILDER_STORAGE_BACKEND"
 _CUBRID_URL_ENV = "KPUBDATA_BUILDER_CUBRID_URL"
+
+# ADR 0016 이 고른 드라이버. sqlalchemy-cubrid 는 dialect 를 네 가지로 등록하는데
+# (`cubrid`, `cubrid.cubrid`, `cubrid.cubriddb`, `cubrid.pycubrid`), 앞의 셋은 모두
+# legacy C-extension(CUBRID-Python, import 이름 `CUBRIDdb`)을 쓰고 순수 파이썬
+# 드라이버는 `pycubrid` 하나뿐이다. `[cubrid]` extra 는 pycubrid 만 설치한다.
+_CUBRID_DRIVER = "pycubrid"
+_CUBRID_DIALECT = "cubrid"
+_CANONICAL_SCHEME = f"{_CUBRID_DIALECT}+{_CUBRID_DRIVER}"
+# 비동기 dialect. Engine 은 동기라 여기서는 쓸 수 없다.
+_ASYNC_DRIVER = "aiopycubrid"
+
+_logger = logging.getLogger(__name__)
 
 StorageBackend = Literal["sqlite", "cubrid"]
 
@@ -43,15 +56,67 @@ def storage_backend() -> StorageBackend:
     raise RuntimeError(f"{_BACKEND_ENV} must be 'sqlite' or 'cubrid', got {raw!r}")
 
 
+def normalize_cubrid_url(url: str) -> str:
+    """URL 이 pycubrid 드라이버를 쓰도록 강제한다 (ADR 0016).
+
+    드라이버를 생략한 ``cubrid://`` 는 SQLAlchemy 가 기본 dialect(= C-extension
+    기반)로 해석해 연결 시점에 ``ImportError: Could not import CUBRIDdb`` 로 죽는다.
+    기동 시 조용히 통과했다가 첫 쿼리에서 터지므로, 여기서 정규화해 그 경로를 없앤다.
+
+    - ``cubrid+pycubrid://`` — 그대로 통과.
+    - ``cubrid://`` — ``cubrid+pycubrid://`` 로 정규화한다(경고 로그).
+    - ``cubrid+cubriddb://`` / ``cubrid+cubrid://`` — 거부. C-extension 드라이버는
+      ``[cubrid]`` extra 가 설치하지 않으며 이 백엔드에서 검증된 적도 없다.
+    - ``cubrid+aiopycubrid://`` — 거부. 동기 ``Engine`` 과 맞지 않는다.
+    - 그 밖의 scheme — 거부(오타/다른 DB URL 주입 방지).
+    """
+    scheme, separator, remainder = url.partition("://")
+    if not separator:
+        raise RuntimeError(
+            f"{_CUBRID_URL_ENV} must be a SQLAlchemy URL like "
+            f"{_CANONICAL_SCHEME}://user:pass@host:33000/db?charset=utf8, got {url!r}"
+        )
+    dialect, _, driver = scheme.partition("+")
+    if dialect != _CUBRID_DIALECT:
+        raise RuntimeError(
+            f"{_CUBRID_URL_ENV} must use the '{_CUBRID_DIALECT}' dialect "
+            f"(e.g. {_CANONICAL_SCHEME}://...), got scheme {scheme!r}"
+        )
+    if driver == _CUBRID_DRIVER:
+        return url
+    if not driver:
+        # 드라이버를 생략한 URL 은 조용히 고치되, 설정이 바뀐 사실은 남긴다.
+        _logger.warning(
+            "%s omits the driver; using %s (a bare cubrid:// URL resolves to the "
+            "legacy CUBRIDdb C-extension, which this build does not install).",
+            _CUBRID_URL_ENV,
+            _CANONICAL_SCHEME,
+        )
+        return f"{_CANONICAL_SCHEME}://{remainder}"
+    if driver == _ASYNC_DRIVER:
+        raise RuntimeError(
+            f"{_CUBRID_URL_ENV} uses the async driver {driver!r}, but this backend "
+            f"runs on a synchronous SQLAlchemy Engine; use {_CANONICAL_SCHEME}:// instead."
+        )
+    raise RuntimeError(
+        f"{_CUBRID_URL_ENV} uses driver {driver!r}, which is backed by the legacy "
+        "CUBRID-Python C-extension. The [cubrid] extra installs the pure-python "
+        f"pycubrid driver only (ADR 0016) — use {_CANONICAL_SCHEME}:// instead."
+    )
+
+
 def cubrid_url() -> str:
-    """CUBRID SQLAlchemy URL. cubrid 백엔드인데 미설정이면 fail-closed."""
+    """CUBRID SQLAlchemy URL. cubrid 백엔드인데 미설정이면 fail-closed.
+
+    반환값은 항상 pycubrid 드라이버로 정규화된다(``normalize_cubrid_url``).
+    """
     url = os.environ.get(_CUBRID_URL_ENV, "").strip()
     if not url:
         raise RuntimeError(
             f"{_BACKEND_ENV}=cubrid requires {_CUBRID_URL_ENV} "
-            "(SQLAlchemy URL, e.g. cubrid+pycubrid://user:pass@host:33000/db?charset=utf8)"
+            f"(SQLAlchemy URL, e.g. {_CANONICAL_SCHEME}://user:pass@host:33000/db?charset=utf8)"
         )
-    return url
+    return normalize_cubrid_url(url)
 
 
 def get_engine() -> Engine:
@@ -73,9 +138,9 @@ def validate_storage_config() -> None:
     """serve 시작 시 호출 (fail-fast, ADR 0016).
 
     - sqlite 백엔드 → no-op.
-    - cubrid 백엔드 → URL 미설정이거나 ``sqlalchemy-cubrid`` 미설치면 기동 거부.
-      (인덱스/매니페스트 쓰기 실패는 런타임에 best-effort 로 삼키지만, 기동 시
-      설정 오류는 조기에 드러내야 한다.)
+    - cubrid 백엔드 → URL 미설정/드라이버 불일치이거나 ``sqlalchemy-cubrid``·
+      ``pycubrid`` 가 없으면 기동 거부. (인덱스/매니페스트 쓰기 실패는 런타임에
+      best-effort 로 삼키지만, 기동 시 설정 오류는 조기에 드러내야 한다.)
     """
     if storage_backend() != "cubrid":
         return
@@ -85,7 +150,16 @@ def validate_storage_config() -> None:
     except ImportError as exc:  # pragma: no cover - extra 미설치 환경
         raise RuntimeError(
             "KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid but sqlalchemy-cubrid is not "
-            "installed; install with: uv sync --extra cubrid (requires Python 3.12+)."
+            "installed; install with: uv sync --extra cubrid."
+        ) from exc
+    try:
+        # URL 을 정규화해도 드라이버 자체가 없으면 첫 쿼리에서 터진다 — 여기서 잡는다.
+        import pycubrid  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - extra 미설치 환경
+        raise RuntimeError(
+            "KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid but the pycubrid driver is not "
+            "installed; install with: uv sync --extra cubrid (sqlalchemy-cubrid alone "
+            "does not pull a driver — ADR 0016 uses sqlalchemy-cubrid[pycubrid])."
         ) from exc
 
 

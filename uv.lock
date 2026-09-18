@@ -840,7 +840,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "sqlalchemy-cubrid", extra = ["pycubrid"], marker = "python_full_version >= '3.12'" },
+    { name = "sqlalchemy-cubrid", extra = ["pycubrid"] },
     { name = "types-pyyaml" },
     { name = "tzdata" },
 ]
@@ -880,8 +880,8 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5,<8" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<1" },
-    { name = "sqlalchemy-cubrid", extras = ["pycubrid"], marker = "python_full_version >= '3.12' and extra == 'dev'", specifier = ">=1.7,<1.8" },
     { name = "sqlalchemy-cubrid", extras = ["pycubrid"], marker = "extra == 'cubrid'", specifier = ">=1.7,<1.8" },
+    { name = "sqlalchemy-cubrid", extras = ["pycubrid"], marker = "extra == 'dev'", specifier = ">=1.7,<1.8" },
     { name = "sqlglot", specifier = ">=30.17,<31" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "typing-extensions", specifier = ">=4.5,<5" },

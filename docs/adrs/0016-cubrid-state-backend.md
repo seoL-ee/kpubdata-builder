@@ -2,7 +2,13 @@
 
 - 상태: 수용됨(Accepted)
 - 관련 이슈/문서: [ADR 0003](./0003-persistent-build-store.md)(영속 Build 저장소), [ADR 0010](./0010-artifactstore-state-backend.md)(ArtifactStore·백엔드 분리, 제안됨), [ADR 0012](./0012-provider-credential-boundary.md)(credential 경계)
-- 드라이버: `sqlalchemy-cubrid[pycubrid]` (v1.7.x, SQLAlchemy `>=2.0,<2.3`, 순수 파이썬 `pycubrid`, Python 3.12+)
+- 드라이버: `sqlalchemy-cubrid[pycubrid]` (v1.7.x, SQLAlchemy `>=2.0,<2.3`, 순수 파이썬 `pycubrid`, Python 3.10+)
+  - `[pycubrid]` extra 가 필수다. `sqlalchemy-cubrid` 만 설치하면 dialect 만 생기고 드라이버는 없다.
+  - **URL 은 반드시 `cubrid+pycubrid://`** 다. sqlalchemy-cubrid 는 dialect 를 `cubrid`,
+    `cubrid.cubrid`, `cubrid.cubriddb`, `cubrid.pycubrid` 넷으로 등록하는데 앞의 셋은 모두
+    legacy C-extension(`CUBRID-Python`, import 이름 `CUBRIDdb`)을 쓴다. 드라이버를 생략한
+    `cubrid://` 는 연결 시점에 `ImportError: Could not import CUBRIDdb` 로 죽으므로,
+    `store/backend.py` 가 기동 시 정규화·검증한다.
 
 ## 맥락
 

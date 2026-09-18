@@ -75,6 +75,9 @@ docker run --rm -p 8000:8000 \
   -e KPUBDATA_BUILDER_API_KEY="$API_KEY" \
   -e KPUBDATA_BUILDER_STORAGE_BACKEND=cubrid \
   -e KPUBDATA_BUILDER_CUBRID_URL="cubrid+pycubrid://user:pass@cubrid-host:33000/kpubdata?charset=utf8" \
+  # URL scheme 은 `cubrid+pycubrid://` 여야 한다 — 드라이버를 생략한 `cubrid://` 는
+  # legacy C-extension(CUBRIDdb) dialect 로 해석된다. 생략하면 기동 시 경고와 함께
+  # pycubrid 로 정규화하고, `cubrid+cubriddb://` 처럼 명시하면 기동을 거부한다(ADR 0016).
   -v /mnt/blockvol/data:/data \
   kpubdata-builder:cubrid
 ```
