@@ -25,6 +25,7 @@
 - 컨테이너 진입점 fail-closed (ADR 0006)
 
 ### 변경됨
+- **패키지 버전을 CHANGELOG 라인에 맞춤 (#592)**: `pyproject.toml` 의 `version` 을 `0.1.0` → `0.4.0.dev0` 으로 올려 이 문서의 v0.4 절과 일치시킨다. `kpubdata_builder.__version__` 은 하드코딩 문자열을 버리고 설치된 배포판 메타데이터에서 파생하므로 버전 정본은 `pyproject.toml` 한 곳뿐이다 — 그동안 GHCR 이미지 태그·`--version` 출력·manifest 의 `builder_version` 이 모두 0.1.0 을 주장하고 있었다. `tests/unit/test_version.py` 가 세 값의 재이탈을 막는다
 - API 계약 1.21.0 → 1.22.0 (`GET /datasets`에 `total` 추가, `GET /quality/summary` 추가, additive, #488/#486 후속)
 - README에 Provider credential store(`KPUBDATA_BUILDER_CREDENTIAL_MASTER_KEY`) 운영 절 추가 — master key 필수/재사용/rotation 시 기존 credential 복호화 불가, 503(store 미구성)과 `configured:false`(미등록) 구분, secret 비노출 원칙
 - API 계약 1.0.0 → 1.2.0 (/healthz + bearerAuth + /catalog + StructuredProblem)
