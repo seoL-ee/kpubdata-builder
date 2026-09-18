@@ -199,6 +199,27 @@ startup 비용 대신 강한 취소·수명 격리를 선택한다. 비동기 bu
 포함되는 파일이 바뀌어야 재스캔이 의미 있음). 문서·테스트 전용 변경은 스캔을
 트리거하지 않으므로 기능 PR과 독립적인 신호를 유지한다.
 
+## 인증 실패 스로틀
+
+인증 게이트는 클라이언트별(TCP peer 주소) 인증 실패를 슬라이딩 윈도로 세고, 한도를
+넘으면 인증을 시도하기 전에 `429`(`code: "auth_throttled"`, `retry_after_seconds`)로
+끊는다. 정적 API 키 추측과 무효 토큰 서명 검증 CPU 소모를 공짜로 반복하지 못하게 하는
+것이 목적이다. 인증에 성공하면 그 클라이언트의 실패 기록은 즉시 비워지므로, 토큰 만료로
+몇 번 401을 받는 정상 사용자는 누적되지 않는다.
+
+- `KPUBDATA_BUILDER_AUTH_FAILURE_LIMIT` (기본 `60`, `0` 이하면 비활성)
+- `KPUBDATA_BUILDER_AUTH_FAILURE_WINDOW_SECONDS` (기본 `60`)
+- 401만 센다 — 403(유효 토큰의 인가 실패)과 503(JWKS 일시 장애)은 카운트하지 않는다.
+- `/healthz`는 인증 게이트 밖이라 스로틀과 무관하게 항상 응답한다.
+
+> **리버스 프록시 주의**: 식별자는 TCP peer 주소이며 `X-Forwarded-For`는 위조 가능하므로
+> 읽지 않는다. 클라이언트 IP를 보존하지 않는 프록시/로드밸런서 뒤에 있으면 모든 요청이
+> 한 버킷을 공유해 한 클라이언트의 실패가 다른 사용자에게 영향을 준다 — 그런 배포에서는
+> 한도를 `0`으로 두어 비활성화하고 프록시 계층에서 스로틀을 거는 편이 낫다.
+>
+> 카운터는 프로세스 로컬이다. 인스턴스를 여러 개 띄우면 인스턴스별로 센다(정확한 전역
+> 한도가 아니라 남용 완화가 목적).
+
 ## 관련
 
 - [ADR 0006](./adrs/0006-service-auth-and-deployment.md) — 인증·배포(fail-closed, Docker)
@@ -213,6 +234,14 @@ Builder는 `OIDC_ISSUER`와 `OIDC_AUDIENCE`가 모두 설정된 정상 OIDC 토�
 issuer·audience·JWKS 서명·만료 검증은 항상 fail-closed로 유지한다. `OIDC_ALLOWED_HD`,
 `OIDC_ALLOWED_SUBJECTS`, `OIDC_ALLOWED_EMAILS`는 필수가 아니라 제한 배포에서만 쓰는
 선택적 2차 인가 규칙이다. 하나라도 설정하면 일치하지 않는 principal은 403이다.
+
+제한 배포에서 허용 목록 누락을 **기동 실패로** 잡고 싶으면
+`OIDC_LEGACY_REQUIRE_ALLOWLIST=true`를 설정한다 — `OIDC_ISSUER`가 있는데 허용 목록이
+하나도 없으면 `serve`가 거부한다. 미설정(기본)이면 공개 가입 정책이 적용된다.
+
+`KPUBDATA_BUILDER_DEV_MODE`는 **인증을 통째로 우회**하므로 로컬 개발 전용이다. 켜진 채로
+기동하면 경고 로그를 남기고, `OIDC_ISSUER`가 함께 설정돼 있으면 (사용자 인증을 구성해두고
+인증을 우회하는 모순된 조합이므로) `serve`가 기동을 거부한다.
 
 Keycloak Admin Console에서 realm의 User registration과 Verify email을 켜고 적절한
 password policy를 설정한다. Google Identity Broker를 사용하려면 broker의 Store Tokens는
