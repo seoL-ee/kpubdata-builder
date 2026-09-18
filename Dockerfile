@@ -3,7 +3,7 @@
 # KPubData Builder — serve 배포 이미지 (#320, ADR 0006).
 #
 # uv sync --no-sources: [tool.uv.sources]의 editable ../kpubdata 오버라이드를 무시하고
-# pyproject의 PyPI 핀(kpubdata>=0.5.0,<0.6, #213)대로 kpubdata를 설치한다. 진입점은
+# pyproject의 PyPI 핀(kpubdata>=0.6.0,<0.7, #213)대로 kpubdata를 설치한다. 진입점은
 # kpubdata-builder serve이며, 환경변수로 설정을 주입한다 (docker-entrypoint.sh).
 #
 # ADR 0006 결정: 컨테이너는 fail-closed로 동작한다. KPUBDATA_BUILDER_API_KEY 없이는
@@ -45,6 +45,9 @@ COPY README.md LICENSE ./
 # exporter(parquet/huggingface layout)는 polars/표준 라이브러리만 쓰므로 extras 없이 동작하지만,
 # publisher(huggingface_hub/kaggle)는 publish extra가 필요하다.
 # 여러 extra는 공백으로(예: --build-arg EXTRAS="publish parquet"), 빈 값(--build-arg EXTRAS=)이면 extra 없음.
+# CUBRID 상태 백엔드(ADR 0013)로 배포하려면 cubrid extra를 포함한다:
+#   --build-arg EXTRAS="publish cubrid"
+# sqlalchemy-cubrid[pycubrid]는 순수 파이썬이라 python:3.12-slim에서 C 툴체인 없이 설치된다.
 ARG EXTRAS=publish
 RUN if [ -z "${EXTRAS}" ]; then \
       uv sync --no-sources; \

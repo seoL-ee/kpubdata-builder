@@ -25,6 +25,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 from ..spec import JsonValue
+from ..store.backend import validate_storage_config
 from ..uploads import resolve_max_upload_bytes
 from .app import BuilderService, FileResponse, dispatch
 from .auth import validate_dev_mode, validate_oidc_config
@@ -379,6 +380,9 @@ def serve(
     # dev-mode로 기동하면 인증이 통째로 꺼진다 — 운영 배포에서 사고가 나지 않도록
     # 경고를 남기고, 모순된 조합(OIDC 구성 + dev-mode)은 기동을 거부한다.
     validate_dev_mode()
+    # 기동 시 상태 백엔드 설정 검증 (fail-closed, ADR 0016). sqlite 기본 시 no-op;
+    # cubrid 이면 URL·드라이버를 조기에 확인한다.
+    validate_storage_config()
     server = BoundedThreadingHTTPServer(
         (host, port), make_handler(service), max_workers=max_workers
     )
