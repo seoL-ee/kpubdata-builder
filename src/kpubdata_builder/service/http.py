@@ -211,6 +211,9 @@ def make_handler(service: BuilderService) -> type[BaseHTTPRequestHandler]:
                     api_key=self.headers.get("X-API-Key"),
                     bearer_token=self.headers.get("Authorization"),
                     raw_body=raw_body,
+                    # 인증 실패 스로틀의 클라이언트 식별자. TCP peer 주소만 쓰고
+                    # X-Forwarded-For는 읽지 않는다 — 헤더는 위조 가능하다.
+                    client_id=self.client_address[0] if self.client_address else None,
                 )
             except Exception:
                 _logger.error(
