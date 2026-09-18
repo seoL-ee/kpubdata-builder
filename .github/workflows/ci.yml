@@ -65,6 +65,28 @@ jobs:
       - name: Run tests
         run: uv run --no-sources pytest
 
+  coverage:
+    # 커버리지 게이트 (#594). 지금 도달한 수준이 조용히 내려가지 않게 잠근다.
+    # 하한은 pyproject 의 [tool.coverage.report] fail_under 한 곳에서만 관리한다.
+    # 테스트 매트릭스에 --cov 를 얹지 않고 이 잡 하나만 계측하는 이유: 5개 잡 전부에
+    # 계측을 걸어도 얻는 정보는 같은데 비용만 5배다.
+    name: Coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --no-sources
+
+      - name: Run tests with coverage
+        run: uv run --no-sources pytest --cov --cov-report=term-missing
+
   min-deps:
     # kpubdata 호환성 정책(#213): 선언된 하한(>=0.6.0)에서 테스트 스위트가
     # 통과하는지 강제한다. 정상 해석 후 kpubdata를 하한으로 고정한다(전체
