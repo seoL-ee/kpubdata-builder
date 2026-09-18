@@ -125,7 +125,7 @@ show_missing = true
 addopts = "-ra -m 'not cubrid'"
 testpaths = ["tests"]
 markers = [
-  "cubrid: CUBRID 백엔드 계약/통합 테스트 (기본 제외; sqlalchemy 필요, ADR 0013).",
+  "cubrid: CUBRID 백엔드 계약/통합 테스트 (기본 제외; sqlalchemy 필요, ADR 0016).",
 ]
 
 [tool.uv.sources]
