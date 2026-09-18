@@ -48,15 +48,7 @@ from ..pipeline import (
 )
 from ..publishers import PUBLISHER_REGISTRY
 from ..quality import QualityCheckResult
-from ..query.engine import QueryExecutionError, QueryTimeoutError
-from ..query.models import QueryRequest, QueryStage
-from ..query.resolver import (
-    QueryArtifactUnavailableError,
-    QueryContextError,
-    resolve_query_context,
-)
-from ..query.security import UnsafeQueryError, validate_read_only_sql
-from ..query.service import QueryBusyError, QueryService
+from ..query.service import QueryService
 from ..spec import BuildSpec, JsonValue, parse_spec
 from ..spec.serializer import BUILDSPEC_SNAPSHOT_FILENAME, compute_spec_digest
 from ..spec.validator import validate_spec
@@ -90,6 +82,7 @@ from .providers import (
     runtime_provider_catalog,
 )
 from .providers_service import ProvidersService
+from .query_service_api import QueryApiService
 from .responses import FileResponse, ServiceResponse
 from .routes import ROUTE_ADAPTERS
 from .routes import uploads as uploads_route
@@ -543,6 +536,7 @@ class BuilderService:
         # upload 저장소는 처음 필요할 때만 SQLite 를 만든다 (#498) — 저장소 객체가 아니라
         # property 를 호출하는 람다를 넘겨 그 지연 생성을 그대로 유지한다.
         self._uploads_service = UploadsService(repository=lambda: self._upload_repository)
+        self._query_api = QueryApiService(output_root=self._output_root, engine=self._query_service)
         self._async_builds = AsyncBuildExecutor(
             max_workers=async_max_workers,
             max_queue_size=async_max_queue_size,
@@ -689,45 +683,7 @@ class BuilderService:
         self, body: Mapping[str, JsonValue] | None, *, principal: Principal
     ) -> ServiceResponse:
         """서버가 resolve한 stage 테이블에 대해 검증된 SQL 쿼리 1건을 실행한다."""
-        try:
-            request = _query_request_from_body(body)
-            context = resolve_query_context(self._output_root, request, principal)
-            validated = validate_read_only_sql(request.sql)
-            result = self._query_service.execute(
-                context.table_path, validated.canonical_sql, limit=request.limit
-            )
-        except PermissionError:
-            return ServiceResponse(403, {"error": "forbidden", "code": "forbidden"})
-        except QueryArtifactUnavailableError:
-            return ServiceResponse(
-                404, {"error": "query artifact unavailable", "code": "artifact_unavailable"}
-            )
-        except QueryContextError as exc:
-            return ServiceResponse(400, {"error": str(exc), "code": "invalid_context"})
-        except UnsafeQueryError as exc:
-            return ServiceResponse(400, {"error": str(exc), "code": "unsafe_query"})
-        except QueryBusyError:
-            return ServiceResponse(429, {"error": "query is busy", "code": "query_busy"})
-        except QueryTimeoutError:
-            return ServiceResponse(504, {"error": "query timed out", "code": "query_timeout"})
-        except QueryExecutionError:
-            return ServiceResponse(
-                400, {"error": "query execution failed", "code": "query_execution_failed"}
-            )
-        except ValueError as exc:
-            return ServiceResponse(400, {"error": str(exc), "code": "invalid_request"})
-
-        return ServiceResponse(
-            200,
-            {
-                "columns": list(result.columns),
-                "rows": list(result.rows),
-                "truncated": result.truncated,
-                "execution_ms": result.execution_ms,
-                "startup_ms": result.startup_ms,
-                "engine_execution_ms": result.engine_execution_ms,
-            },
-        )
+        return self._query_api.query(body, principal=principal)
 
     def version(self) -> ServiceResponse:
         """Builder API 계약 버전을 반환한다 (#209).
@@ -2479,39 +2435,6 @@ class BuilderService:
                 ]
             return ServiceResponse(400, body)
         return spec
-
-
-def _query_request_from_body(body: Mapping[str, JsonValue] | None) -> QueryRequest:
-    if body is None:
-        raise ValueError("request body is required")
-    if not set(body).issubset({"dataset_id", "run_id", "stage", "source", "sql", "limit"}):
-        raise ValueError("request contains unknown fields")
-    dataset_id = body.get("dataset_id")
-    run_id = body.get("run_id")
-    stage = body.get("stage")
-    sql = body.get("sql")
-    source = body.get("source")
-    limit = body.get("limit", 100)
-    if not isinstance(dataset_id, str) or not dataset_id:
-        raise ValueError("dataset_id must be a non-empty string")
-    if not isinstance(run_id, str) or not run_id:
-        raise ValueError("run_id must be a non-empty string")
-    if stage not in ("silver", "gold"):
-        raise ValueError("stage must be silver or gold")
-    if not isinstance(sql, str) or not sql:
-        raise ValueError("sql must be a non-empty string")
-    if source is not None and (not isinstance(source, str) or not source):
-        raise ValueError("source must be a non-empty string when provided")
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
-        raise ValueError("limit must be an integer from 1 to 500")
-    return QueryRequest(
-        dataset_id=dataset_id,
-        run_id=run_id,
-        stage=cast(QueryStage, stage),
-        source=source,
-        sql=sql,
-        limit=limit,
-    )
 
 
 def dispatch(
