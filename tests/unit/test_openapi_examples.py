@@ -13,8 +13,8 @@ from typing import Any, cast
 import pytest
 import yaml
 
-import kpubdata_builder.service.app as app_module
 import kpubdata_builder.service.datasets as datasets_module
+import kpubdata_builder.service.query_service_api as query_module
 from kpubdata_builder.query.models import QueryResult
 from kpubdata_builder.query.resolver import ResolvedQueryContext
 from kpubdata_builder.query.service import QueryService
@@ -216,7 +216,7 @@ def test_query_success_example_matches_service_serializer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        app_module,
+        query_module,
         "resolve_query_context",
         lambda root, request, principal: ResolvedQueryContext(
             request.dataset_id,
