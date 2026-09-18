@@ -70,6 +70,11 @@ jobs:
         env:
           # CUBRID 기본 dba/빈 비밀번호(개발용). broker 포트 33000.
           KPUBDATA_BUILDER_CUBRID_URL: cubrid+pycubrid://dba:@127.0.0.1:33000/kpubdata?charset=utf8
+          KPUBDATA_BUILDER_STORAGE_BACKEND: cubrid
+          # 이 잡의 존재 이유가 "실 CUBRID dialect 검증"이므로 SQLite 폴백을 금지한다.
+          # 가드가 없으면 URL 주입이 빠졌을 때 fixture 가 조용히 in-memory SQLite 로
+          # 내려앉아, CUBRID 를 한 줄도 건드리지 않은 채 잡이 초록으로 통과한다 (#587).
+          KPUBDATA_BUILDER_REQUIRE_REAL_CUBRID: "1"
         run: uv run --no-sources pytest tests/cubrid -m cubrid -v
 
       - name: CUBRID logs on failure

@@ -4,7 +4,12 @@
 
 engine fixture 는 ``KPUBDATA_BUILDER_CUBRID_URL`` 이 설정되면 **실 CUBRID** 에 붙고,
 없으면 in-memory SQLite 엔진으로 SQLAlchemy Core 로직을 검증한다(dialect 독립적). 실 CUBRID
-통합은 docker-compose 로 CUBRID 컨테이너를 띄운 전용 CI 잡에서 URL 을 주입해 돌린다.
+통합은 CUBRID 컨테이너를 띄운 전용 CI 잡(.github/workflows/cubrid.yml)에서 URL 을 주입해 돌린다.
+
+이 폴백에는 함정이 하나 있다(#587): 전용 CI 잡에서 URL 주입이 빠지면 fixture 가 조용히
+SQLite 로 내려앉고, **CUBRID dialect 를 한 줄도 건드리지 않은 채 초록으로 통과한다**. 그래서
+``KPUBDATA_BUILDER_REQUIRE_REAL_CUBRID=1`` 을 주면 폴백을 금지한다 — CI 잡이 이 값을 켜므로,
+URL 이 사라지면 조용히 통과하는 대신 잡이 실패한다.
 
 테스트는 자기 소유 key(unique run_id/owner_id)만 단언해 공유 CUBRID 에서도 안전하다.
 """
@@ -28,15 +33,46 @@ from kpubdata_builder.store.build_index_cubrid import CubridBuildIndex  # noqa: 
 pytestmark = pytest.mark.cubrid
 
 
+_REQUIRE_REAL_ENV = "KPUBDATA_BUILDER_REQUIRE_REAL_CUBRID"
+
+
+def _require_real_cubrid() -> bool:
+    """전용 CI 잡인지 여부. 참이면 SQLite 폴백을 금지한다 (#587)."""
+    return os.environ.get(_REQUIRE_REAL_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 @pytest.fixture
 def engine():  # type: ignore[no-untyped-def]
     url = os.environ.get("KPUBDATA_BUILDER_CUBRID_URL")
+    if not url and _require_real_cubrid():
+        raise AssertionError(
+            f"{_REQUIRE_REAL_ENV} is set but KPUBDATA_BUILDER_CUBRID_URL is empty — this run "
+            "would silently fall back to in-memory SQLite and prove nothing about the CUBRID "
+            "dialect. Set the URL or unset the guard."
+        )
     if url:
         eng = create_engine(url, pool_pre_ping=True, future=True)
     else:
         eng = create_engine("sqlite:///:memory:", future=True)
     yield eng
     eng.dispose()
+
+
+def test_ci_job_runs_against_a_real_cubrid_engine(engine) -> None:  # type: ignore[no-untyped-def]
+    """전용 CI 잡에서 실제로 CUBRID dialect 위에서 돌고 있는지 확인한다 (#587).
+
+    로컬(가드 미설정)에서는 SQLite 폴백이 정상이므로 skip 한다.
+    """
+    if not _require_real_cubrid():
+        pytest.skip(f"{_REQUIRE_REAL_ENV} not set — SQLite fallback is expected locally")
+    assert engine.dialect.name == "cubrid", (
+        f"expected the cubrid dialect, got {engine.dialect.name!r} — the contract tests are "
+        "not exercising CUBRID"
+    )
+    # 드라이버까지 확인한다: bare cubrid:// 는 legacy C-extension 으로 풀린다(ADR 0016).
+    assert engine.dialect.driver == "pycubrid", (
+        f"expected the pycubrid driver, got {engine.dialect.driver!r}"
+    )
 
 
 def test_build_index_crud_and_ordering(engine) -> None:  # type: ignore[no-untyped-def]
@@ -184,3 +220,51 @@ def test_artifact_store_manifest_authoritative(tmp_path, engine) -> None:  # typ
 
     ids = set(store.list_run_ids())
     assert {"cbx-run", "cbx-fsonly"} <= ids
+
+
+def test_startup_validation_accepts_a_reachable_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """실 CUBRID CI 에서 serve 기동 전 설정 검증이 통과해야 한다 (#587 fail-closed).
+
+    ``validate_storage_config`` 는 URL 정규화 + 드라이버 설치 여부까지 본다. 로컬
+    SQLite 폴백에서는 검증할 URL 자체가 없으므로 실 CUBRID 잡에서만 의미가 있다.
+    """
+    url = os.environ.get("KPUBDATA_BUILDER_CUBRID_URL")
+    if not url:
+        pytest.skip("real CUBRID URL not configured")
+
+    from kpubdata_builder.store.backend import validate_storage_config
+
+    monkeypatch.setenv("KPUBDATA_BUILDER_STORAGE_BACKEND", "cubrid")
+    monkeypatch.setenv("KPUBDATA_BUILDER_CUBRID_URL", url)
+    validate_storage_config()
+
+
+def test_startup_validation_refuses_a_bare_cubrid_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """드라이버를 생략한 URL 은 legacy C-extension 으로 풀린다 — 기동 전에 막아야 한다.
+
+    이 경로가 열려 있으면 기동은 조용히 성공하고 **첫 쿼리에서** ``ImportError:
+    Could not import CUBRIDdb`` 로 죽는다(ADR 0016).
+    """
+    from kpubdata_builder.store.backend import cubrid_url
+
+    monkeypatch.setenv("KPUBDATA_BUILDER_STORAGE_BACKEND", "cubrid")
+    monkeypatch.setenv("KPUBDATA_BUILDER_CUBRID_URL", "cubrid://dba:@127.0.0.1:33000/kpubdata")
+    # 드라이버 생략은 거부가 아니라 정규화 대상이다 — pycubrid 로 고쳐서 돌려준다.
+    assert cubrid_url().startswith("cubrid+pycubrid://")
+
+
+@pytest.mark.parametrize("driver", ["cubriddb", "cubrid", "aiopycubrid"])
+def test_startup_validation_refuses_unsupported_drivers(
+    driver: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[cubrid] extra 가 설치하지 않는 드라이버로는 기동을 허용하지 않는다."""
+    from kpubdata_builder.store.backend import cubrid_url
+
+    monkeypatch.setenv("KPUBDATA_BUILDER_STORAGE_BACKEND", "cubrid")
+    monkeypatch.setenv(
+        "KPUBDATA_BUILDER_CUBRID_URL", f"cubrid+{driver}://dba:@127.0.0.1:33000/kpubdata"
+    )
+    with pytest.raises(RuntimeError):
+        cubrid_url()
