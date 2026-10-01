@@ -390,7 +390,9 @@ _BuildListEntry = dict[str, str | None]
 # 1.73.0 -> 1.74.0: queries, rows, aggregates, profiles and exports run on a locked DuckDB
 #   connection (#874); result types follow DuckDB in Builder's spelling (COUNT int64,
 #   SUM of integers int128, unnamed aggregates named by DuckDB, DESC nulls last).
-API_CONTRACT_VERSION = "1.74.0"
+# 1.74.0 -> 1.75.0: saved analyses record their SQL dialect and engine; a legacy-polars
+#   analysis answers 409 analysis_migration_required to run (#875, additive).
+API_CONTRACT_VERSION = "1.75.0"
 
 
 #: manifest status vocabulary (ok/failed/cancelled) → publish status vocabulary
