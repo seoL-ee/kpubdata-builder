@@ -10,6 +10,10 @@
 
 이 스크립트는 향후 Builder의 Medallion Architecture(Bronze/Silver/Gold/Exporter/Publisher) 모듈로 분해될 레퍼런스 구현입니다.
 
+> **레거시 경로** ([ADR 0018](adrs/0018-legacy-publish-pipeline.md)). 이 스크립트는 지금도 Polars 로 표를
+> 다루지만, Builder 본체(`src/kpubdata_builder`)는 DuckDB 만 쓴다([ADR 0021](adrs/0021-duckdb-tabular-engine.md), #876).
+> 아래의 Polars 언급은 모두 이 레거시 스크립트에 대한 것이다.
+
 ```text
 [YAML Config] → fetch → transform → write_parquet → generate_card → upload_to_hf / upload_to_kaggle
                   │          │            │                │              │
@@ -76,10 +80,10 @@ org 단위로 데이터셋을 관리하려면:
 
 ```bash
 cd kpubdata-builder
-uv sync --extra publish
+uv sync --extra publish --extra legacy-publish
 ```
 
-`publish` extra에는 `polars`, `huggingface-hub`, `kaggle`이 포함됩니다.
+`publish` extra에는 `huggingface-hub`, `xmltodict`, `kaggle`이, `legacy-publish` extra에는 이 스크립트가 쓰는 `polars`가 들어 있습니다(#876).
 
 ---
 
@@ -165,7 +169,7 @@ BuildSpec 으로 만든 run 은 **kpubdata 가 데이터셋마다 선언한 조�
 - 성공한 게시는 응답과 receipt 의 `redistribution` 에 판정, 판정을 읽은 kpubdata 버전(`kpubdata_version`), `confirm_non_commercial` 을 남긴다. `confirm_non_commercial` 은 Builder 의 확인이라 publisher 로 넘기지 않는다.
 - CLI: `kpubdata-builder publish` 에도 같은 게이트가 있다. 막히면 종료 코드 2, 비영리 확인은 `--confirm-non-commercial`.
 - 2026-09-30 현재 kpubdata 카탈로그의 어떤 데이터셋도 `redistribution` 을 선언하지 않았으므로, BuildSpec 경로의 **공개 게시는 모두 막힌다**. 조건을 정하는 일은 kpubdata#524 다.
-- 선언된 PII(#689, #900)는 같은 출구(`/query`, `/preview`, stage 상세, artifact 다운로드)에서 약관 판정 **다음에** 확인한다. 약관이 `forbidden` 이 아니면 Silver·Bronze 를 읽는 경로가 선언 컬럼을 Gold 처럼 가리거나(질의·미리보기·sample), 원본 파일이면 403 `declared_pii_withheld` 로 거부한다. kpubdata 선언을 읽지 못하면 가릴 컬럼을 모르므로 503 `pii_declaration_unavailable` 로 거부한다(모르는 것은 허가가 아니다). 결정과 이유는 [API_CONTRACT.md](../API_CONTRACT.md) 의 "Silver·Bronze 읽기의 선언된 PII".
+- 선언된 PII(#689, #900)는 같은 출구(`/query`, `/preview`, stage 상세, artifact 다운로드)에서 약관 판정 **다음에** 확인한다. 약관이 `forbidden` 이 아니면 Silver·Bronze 를 읽는 경로가 선언 컬럼을 Gold 처럼 가리거나(질의·미리보기·sample), 원본 파일이면 403 `declared_pii_withheld` 로 거부한다. kpubdata 선언을 읽지 못하면 가릴 컬럼을 모르므로 503 `pii_declaration_unavailable` 로 거부한다(모르는 것은 허가가 아니다). 결정과 이유는 [API_CONTRACT.md](API_CONTRACT.md) 의 "Silver·Bronze 읽기의 선언된 PII".
 
 ### 데이터셋 카드 (#694)
 
@@ -447,7 +451,7 @@ uv sync --extra publish
 | 스크립트 함수 | 분해 대상 모듈 | 디렉토리 |
 | :--- | :--- | :--- |
 | `fetch_records()` | Bronze stage | `src/kpubdata_builder/stages/bronze/` |
-| `transform_records()` | Silver stage (Polars engine) | `src/kpubdata_builder/stages/silver/`, `tabular/` |
+| `transform_records()` | Silver stage (DuckDB, ADR 0021) | `src/kpubdata_builder/stages/silver/`, `tabular/` |
 | `write_parquet()` | Gold stage | `src/kpubdata_builder/stages/gold/` |
 | `generate_dataset_card()` | HF Layout Exporter | `src/kpubdata_builder/exporters/` |
 | `upload_to_hf()` | HF Publisher | `src/kpubdata_builder/publishers/` |

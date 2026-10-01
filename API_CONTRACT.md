@@ -240,6 +240,26 @@ v0.4 Builder service는 동기식 실행 모델을 유지합니다.
   filesystem/network 접근, DML/DDL은 거부합니다.
 - query는 HTTP worker pool과 별도인 bounded capacity를 사용합니다. Query timeout은 child
   process를 실제 종료하며 429/504 오류는 안정적인 `code`로 구분됩니다.
+- SQL 방언은 DuckDB 다(계약 1.74.0, #874). 질의는 고정된 snapshot 파일 하나만 읽을 수 있는
+  잠긴 DuckDB 연결에서 돈다.
+
+### DuckDB 전환과 클라이언트 호환 (ADR 0021, #877)
+
+Builder 의 tabular 엔진은 Polars 에서 DuckDB 로 바뀌었다(#864–#877). 엔진 이름은 wire 의
+일부가 아니다 — 클라이언트(Studio 포함, kpubdata-studio#565)가 알아야 하는 것은 아래의 계약
+변경뿐이고, 사용자에게는 "Builder SQL" 로 보이면 된다. 방언을 설명해야 할 때만 DuckDB 호환이라고
+적는다.
+
+| 계약 | 바뀐 것 | 클라이언트가 할 일 |
+| :--- | :--- | :--- |
+| 1.60.0 (#867) | `provenance[].data_checksum` 알고리즘이 `canonical-multiset-v2` 로 바뀌고 `data_checksum_algorithm` 으로 표시된다. 바이트 digest(`artifacts[].artifact_digest`)는 따로 있다. `artifact_writer` 는 Gold 를 쓴 엔진이다 — #876 부터 `duckdb` | 알고리즘이 다른 checksum 을 비교하지 않는다 |
+| 1.70.0 (#871) | ratio split 이 `hash-sort-v2`(manifest `split_algorithm`). 같은 seed 라도 행 배정이 `shuffle-v1` 과 다르다 | split 결과를 이전 run 과 행 단위로 비교하지 않는다 |
+| 1.74.0 (#874) | SQL·rows·aggregate·profile·export 가 DuckDB 에서 돈다. 결과 타입은 DuckDB 를 Builder dtype 이름으로 부른 것: `COUNT(*)` 는 `int64`, 정수 `SUM` 은 `int128`(값에 따라 숫자 또는 정확한 decimal 문자열), 이름 없는 집계는 DuckDB 가 붙인 이름(`count_star()`), `DESC` 정렬은 null 이 마지막, zoned datetime 은 UTC. 설정·버전 조회 함수와 비결정적 SQL(`random`, `now`, 샘플링)은 `unsafe_query` | 열 이름·타입을 응답의 `columns`·`column_meta` 에서 읽고 하드코딩하지 않는다. `wire_encoding` 으로 값을 해석한다 |
+| 1.75.0 (#875) | `SavedAnalysis` 에 `sql_dialect`(`duckdb` 또는 `legacy-polars`), `engine`, `engine_version`, `query_contract_version`, `migration_required` | `migration_required` 인 분석은 실행 대신 SQL 을 검토해 새 분석으로 저장하게 안내한다 — 실행하면 409 `analysis_migration_required` |
+
+오류 코드(`query_busy` 429, `query_timeout` 504, `query_execution_failed`, `unsafe_query`,
+`invalid_request`)는 바뀌지 않았다. 메모리·spill 한도를 넘은 질의도 `query_execution_failed` 로
+답한다(#961 에서 구분 여부를 정한다).
 
 ### Silver·Bronze 읽기의 선언된 PII (#900)
 
@@ -249,7 +269,7 @@ Gold 는 선언된 PII(kpubdata `license.pii_columns` + BuildSpec `sources[].gol
 
 | 경로 | 동작 |
 | :--- | :--- |
-| `POST /query` `stage: silver` | 선언 컬럼을 마스킹한 Silver 사본 위에서 질의한다. `upper(col)`·`substr`·`WHERE col = '…'` 같은 식도 원래 값을 보지 못한다. 사본은 질의 엔진과 같은 `scan_builder_parquet` 로 읽어 DuckDB 가 파일 metadata 에 남긴 Builder dtype·실제 컬럼 이름(#891)을 되살린 뒤 쓰므로, 응답의 `columns`·`column_meta` 는 마스킹하지 않은 질의와 같다(all-null·Duration·Int128·zone 포함). 응답의 `masked_columns` 가 가린 컬럼을 적는다. `stage: gold` 는 빌드 때 이미 마스킹되어 변하지 않는다 |
+| `POST /query` `stage: silver` | 선언 컬럼을 마스킹한 Silver 사본 위에서 질의한다. `upper(col)`·`substr`·`WHERE col = '…'` 같은 식도 원래 값을 보지 못한다. 사본은 DuckDB 가 원본의 Builder dtype·실제 컬럼 이름(#891)을 그대로 파일 metadata 에 다시 적어 쓰므로, 응답의 `columns`·`column_meta` 는 마스킹하지 않은 질의와 같다(all-null·Duration·Int128·zone 포함). 응답의 `masked_columns` 가 가린 컬럼을 적는다. `stage: gold` 는 빌드 때 이미 마스킹되어 변하지 않는다 |
 | `POST /preview` | 소스별 `sample`, `source_sample`(원본 필드명 — `schema.coalesce`·`rename` 을 거꾸로 따라간다), 그 컬럼의 `diffs` 를 가리고 `masked_columns` 를 적는다 |
 | `GET /builds/{run_id}/stages/silver/{source}` | `sample` 을 가리고 `masked_columns` 를 적는다. Bronze stage 상세에는 행이 없다 |
 | `GET /artifacts/{run_id}/{file_path}` | 선언 컬럼이 있는 소스의 `bronze/{source}/…`·`silver/{source}/…` 파일은 **전부 403 `declared_pii_withheld`**(`columns` 에 컬럼 이름만). Gold 파일과 manifest 는 그대로 내려간다 |
